@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Loader2, User, Bot, AlertCircle } from "lucide-react";
+import { Send, Loader2, User, AlertCircle } from "lucide-react";
 import type { ChatMessage } from "../types";
 import { streamMessage, getSession } from "../lib/api";
 import { cn } from "../lib/utils";
@@ -9,6 +9,7 @@ import { Button } from "./ui/Button";
 import { Skeleton } from "./ui/Skeleton";
 import { Card } from "./ui/Card";
 import { ImageUploader } from "./ImageUploader";
+import { Logo } from "./Logo";
 
 interface ChatBoxProps {
   sessionId?: string;
@@ -275,8 +276,8 @@ export function ChatBox({
           ) : messages.length === 0 ? (
             /* Empty State */
             <div className="flex flex-col items-center justify-center py-20 text-center animate-slide-up">
-              <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center mb-6 shadow-sm">
-                <Bot className="w-8 h-8 text-primary" />
+              <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center mb-6 shadow-sm p-3">
+                <Logo size="lg" />
               </div>
               <h2 className="text-2xl font-semibold text-foreground mb-3">
                 {sessionId ? "开始新对话..." : "你好！我是 AssistantBot"}
@@ -299,8 +300,8 @@ export function ChatBox({
                   )}
                 >
                   {msg.role === "assistant" && (
-                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0 mt-1">
-                      <Bot className="w-5 h-5 text-primary" />
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0 mt-1 overflow-hidden">
+                      <Logo size="sm" />
                     </div>
                   )}
                   <div
@@ -346,8 +347,8 @@ export function ChatBox({
               {/* Loading Indicator - 只在最后一条消息有内容时才显示独立的加载动画 */}
               {isLoading && messages[messages.length - 1]?.role === "assistant" && messages[messages.length - 1]?.content && (
                  <div className="flex justify-start gap-4 animate-fade-in">
-                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0 mt-1">
-                      <Bot className="w-5 h-5 text-primary" />
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0 mt-1 overflow-hidden">
+                      <Logo size="sm" />
                     </div>
                     <div className="px-5 py-3.5 bg-card border border-border rounded-2xl rounded-tl-sm shadow-sm">
                       <div className="flex items-center gap-1.5 h-5">

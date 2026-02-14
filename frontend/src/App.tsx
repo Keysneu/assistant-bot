@@ -5,16 +5,16 @@ import { SessionList } from "./components/SessionList";
 import { healthCheck } from "./lib/api";
 import type { HealthResponse } from "./types";
 import {
-  MessageSquare,
   FileText,
   Plus,
   PanelLeftClose,
   PanelLeft,
-  LayoutDashboard,
   Settings,
   ChevronRight,
   Loader2,
+  MessageSquare,
 } from "lucide-react";
+import { Logo } from "./components/Logo";
 
 const ChatBox = lazy(() => import("./components/ChatBox").then(module => ({ default: module.ChatBox })));
 const DocumentManager = lazy(() => import("./components/DocumentManager").then(module => ({ default: module.DocumentManager })));
@@ -110,9 +110,9 @@ function App() {
       >
         {/* Sidebar Header */}
         <div className="h-14 flex items-center justify-between px-4 border-b border-border flex-shrink-0">
-          <div className="flex items-center gap-2 font-semibold text-lg tracking-tight">
-            <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-primary-foreground">
-              <MessageSquare className="w-5 h-5" />
+          <div className="flex items-center gap-3 font-semibold text-lg tracking-tight">
+            <div className="rounded-lg overflow-hidden">
+              <Logo size="md" />
             </div>
             <span>AssistantBot</span>
           </div>
