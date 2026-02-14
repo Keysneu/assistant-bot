@@ -369,13 +369,9 @@ export function ChatBox({
           onSubmit={handleSubmit}
           className="max-w-3xl mx-auto relative group"
         >
-          <div className={cn(
-            "relative flex items-end bg-card border border-input rounded-xl shadow-sm transition-all duration-200",
-            "focus-within:ring-2 focus-within:ring-ring focus-within:border-primary focus-within:shadow-md",
-            "hover:border-primary/50"
-          )}>
-            {/* Image uploader */}
-            <div className="absolute left-3 bottom-3 z-10">
+          <div className="flex items-end gap-4">
+            {/* Image uploader - 独立在输入框左侧 */}
+            <div className="flex-shrink-0">
               <ImageUploader
                 onImageSelect={(data, format) => {
                   setSelectedImageData(data);
@@ -385,48 +381,61 @@ export function ChatBox({
               />
             </div>
 
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={
-                isBackendAvailable
-                  ? "发送消息... (Enter 发送, Shift+Enter 换行)"
-                  : "后端服务未启动..."
-              }
-              className="flex-1 min-h-[52px] max-h-[200px] px-4 py-3.5 bg-transparent text-foreground placeholder:text-muted-foreground resize-none focus:outline-none text-sm leading-relaxed pr-24 pl-14 rounded-xl"
-              disabled={isLoading || !isBackendAvailable}
-              rows={1}
-              style={{
-                height: "auto",
-              }}
-              onInput={(e) => {
-                const target = e.target as HTMLTextAreaElement;
-                target.style.height = "auto";
-                target.style.height = Math.min(target.scrollHeight, 200) + "px";
-              }}
-            />
-            <Button
-              type="submit"
-              size="icon"
-              disabled={(!input.trim() && !selectedImageData) || isLoading || !isBackendAvailable}
-              className={cn(
-                "absolute right-2 bottom-2 transition-all duration-200 h-8 w-8",
-                (input.trim() || selectedImageData) && !isLoading && isBackendAvailable
-                  ? "bg-primary text-primary-foreground hover:bg-primary/90 shadow-sm"
-                  : "bg-muted text-muted-foreground cursor-not-allowed hover:bg-muted"
-              )}
-            >
-              {isLoading ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-            </Button>
+            {/* Input wrapper */}
+            <div className={cn(
+              "relative flex-1 flex items-end bg-card border border-input rounded-2xl shadow-lg transition-all duration-300",
+              "focus-within:ring-2 focus-within:ring-ring focus-within:border-primary/50 focus-within:shadow-xl",
+              "hover:border-primary/30 hover:shadow-md"
+            )}>
+              {/* 背景装饰 - 光泽效果 */}
+              <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-white/10 to-transparent pointer-events-none" />
+
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  isBackendAvailable
+                    ? "发送消息... (Enter 发送, Shift+Enter 换行)"
+                    : "后端服务未启动..."
+                }
+                className="flex-1 min-h-[52px] max-h-[200px] px-4 py-3.5 bg-transparent text-foreground placeholder:text-muted-foreground resize-none focus:outline-none text-sm leading-relaxed pr-14 rounded-2xl"
+                disabled={isLoading || !isBackendAvailable}
+                rows={1}
+                style={{
+                  height: "auto",
+                }}
+                onInput={(e) => {
+                  const target = e.target as HTMLTextAreaElement;
+                  target.style.height = "auto";
+                  target.style.height = Math.min(target.scrollHeight, 200) + "px";
+                }}
+              />
+              <Button
+                type="submit"
+                size="icon"
+                disabled={(!input.trim() && !selectedImageData) || isLoading || !isBackendAvailable}
+                className={cn(
+                  "absolute right-2 bottom-2 transition-all duration-300 h-10 w-10 rounded-xl",
+                  (input.trim() || selectedImageData) && !isLoading && isBackendAvailable
+                    ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:scale-105 shadow-lg shadow-primary/20"
+                    : "bg-muted text-muted-foreground cursor-not-allowed hover:bg-muted"
+                )}
+              >
+                {isLoading ? (
+                  <Loader2 className="w-4.5 h-4.5 animate-spin" />
+                ) : (
+                  <Send className="w-5 h-5" />
+                )}
+              </Button>
+            </div>
           </div>
-          <p className="text-[10px] text-muted-foreground mt-2 text-center opacity-70">
-            由 Qwen2.5-7B 驱动 · 支持知识库检索与图片理解
+          <p className="text-[10px] text-muted-foreground/80 mt-2.5 text-center flex items-center justify-center gap-1.5">
+            <span className="inline-flex items-center gap-1">
+              <span className="w-1 h-1 rounded-full bg-primary/60 animate-pulse" />
+              由 Qwen2.5-7B 驱动 · 支持知识库检索与图片理解
+            </span>
           </p>
         </form>
       </div>
