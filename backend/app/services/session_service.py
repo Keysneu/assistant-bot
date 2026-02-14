@@ -61,7 +61,10 @@ def _save_sessions():
             {
                 "role": msg.role,
                 "content": msg.content,
-                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None
+                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+                "has_image": msg.has_image if hasattr(msg, "has_image") else False,
+                "image_data": msg.image_data if hasattr(msg, "image_data") else None,
+                "image_format": msg.image_format if hasattr(msg, "image_format") else None,
             }
             for msg in messages
         ]
@@ -98,13 +101,23 @@ def create_session(title: str = None) -> str:
     return session_id
 
 
-def add_message(session_id: str, role: str, content: str) -> ChatMessage:
+def add_message(
+    session_id: str,
+    role: str,
+    content: str,
+    has_image: bool = False,
+    image_data: str = None,
+    image_format: str = None
+) -> ChatMessage:
     """Add a message to the conversation history.
 
     Args:
         session_id: Session identifier
         role: Message role ('user' or 'assistant')
         content: Message content
+        has_image: Whether the message has an attached image
+        image_data: Base64 encoded image data
+        image_format: Image format (png, jpeg, etc.)
 
     Returns:
         The created message
@@ -117,6 +130,9 @@ def add_message(session_id: str, role: str, content: str) -> ChatMessage:
         role=role,
         content=content,
         timestamp=datetime.utcnow(),
+        has_image=has_image,
+        image_data=image_data,
+        image_format=image_format,
     )
     _sessions[session_id].append(message)
 
@@ -209,7 +225,10 @@ def get_session_info(session_id: str) -> Optional[Dict]:
             {
                 "role": msg.role,
                 "content": msg.content,
-                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None
+                "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+                "has_image": msg.has_image if hasattr(msg, "has_image") else False,
+                "image_data": msg.image_data if hasattr(msg, "image_data") else None,
+                "image_format": msg.image_format if hasattr(msg, "image_format") else None,
             }
             for msg in _sessions[session_id]
         ]

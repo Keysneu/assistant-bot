@@ -40,6 +40,14 @@ async def lifespan(app: FastAPI):
         get_collection()
         print("  ✓ Vector database ready")
 
+        # Initialize vision model for multimodal support
+        from app.services.vision_service import is_vision_available
+        print("  Checking vision service availability...")
+        if is_vision_available():
+            print("  ✓ Vision service ready")
+        else:
+            print("  ⚠️ Vision service unavailable (image analysis disabled)")
+
         print("✅ All services initialized successfully!")
     except Exception as e:
         print(f"⚠️ Service initialization error: {e}")

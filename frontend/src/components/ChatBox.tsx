@@ -8,6 +8,7 @@ import { cn } from "../lib/utils";
 import { Button } from "./ui/Button";
 import { Skeleton } from "./ui/Skeleton";
 import { Card } from "./ui/Card";
+import { ImageUploader } from "./ImageUploader";
 
 interface ChatBoxProps {
   sessionId?: string;
@@ -35,6 +36,9 @@ export function ChatBox({
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isBackendAvailable, setIsBackendAvailable] = useState(true);
+  // Multimodal state
+  const [selectedImageData, setSelectedImageData] = useState("");
+  const [selectedImageFormat, setSelectedImageFormat] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const hasAttemptedConnection = useRef(false);
@@ -49,6 +53,10 @@ export function ChatBox({
             role: msg.role as "user" | "assistant",
             content: msg.content,
             timestamp: new Date(msg.timestamp),
+            // 多模态支持：保留图片相关字段
+            has_image: msg.has_image,
+            image_data: msg.image_data,
+            image_format: msg.image_format,
           }));
           setMessages(historyMessages);
           setIsBackendAvailable(true);
@@ -86,7 +94,7 @@ export function ChatBox({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if ((!input.trim() && !selectedImageData) || isLoading) return;
 
     if (!isBackendAvailable) {
       setIsLoading(true);
@@ -102,6 +110,8 @@ export function ChatBox({
         setIsLoading(false);
       }, 500);
       setInput("");
+      setSelectedImageData("");
+      setSelectedImageFormat("");
       return;
     }
 
@@ -109,11 +119,19 @@ export function ChatBox({
       role: "user",
       content: input.trim(),
       timestamp: new Date(),
+      has_image: !!selectedImageData,
+      image_data: selectedImageData || undefined,
+      image_format: selectedImageFormat || undefined,
     };
 
     setMessages((prev) => [...prev, userMessage]);
     const messageToSend = input.trim();
+    const imageDataToSend = selectedImageData;
+    const imageFormatToSend = selectedImageFormat;
+
     setInput("");
+    setSelectedImageData("");
+    setSelectedImageFormat("");
     setIsLoading(true);
 
     const assistantMessage: ChatMessage = {
@@ -127,7 +145,12 @@ export function ChatBox({
       let fullResponse = "";
       let newSessionId: string | null = null;
 
-      for await (const token of streamMessage(messageToSend, sessionId)) {
+      for await (const token of streamMessage(
+        messageToSend,
+        sessionId,
+        imageDataToSend,
+        imageFormatToSend,
+      )) {
         try {
           const parsed = JSON.parse(token);
           if (parsed.session_id) {
@@ -288,14 +311,28 @@ export function ChatBox({
                         : "bg-card border border-border text-card-foreground rounded-2xl rounded-tl-sm"
                     )}
                   >
+                    {/* Display image if present */}
+                    {msg.has_image && msg.image_data && (
+                      <div className="mb-3 rounded-lg overflow-hidden">
+                        <img
+                          src={`data:image/${msg.image_format || "png"};base64,${msg.image_data}`}
+                          alt="Uploaded image"
+                          className="max-w-full h-auto rounded-lg"
+                        />
+                      </div>
+                    )}
                     {msg.role === "assistant" ? (
                       <div className="text-sm leading-relaxed">
                         {msg.content ? renderMarkdown(msg.content) : <span className="animate-pulse">...</span>}
                       </div>
                     ) : (
-                      <p className="text-sm whitespace-pre-wrap leading-relaxed">
-                        {msg.content}
-                      </p>
+                      <div>
+                        {msg.content && (
+                          <p className="text-sm whitespace-pre-wrap leading-relaxed">
+                            {msg.content}
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
                   {msg.role === "user" && (
@@ -337,6 +374,17 @@ export function ChatBox({
             "focus-within:ring-2 focus-within:ring-ring focus-within:border-primary focus-within:shadow-md",
             "hover:border-primary/50"
           )}>
+            {/* Image uploader */}
+            <div className="absolute left-3 bottom-3 z-10">
+              <ImageUploader
+                onImageSelect={(data, format) => {
+                  setSelectedImageData(data);
+                  setSelectedImageFormat(format);
+                }}
+                disabled={isLoading || !isBackendAvailable}
+              />
+            </div>
+
             <textarea
               ref={textareaRef}
               value={input}
@@ -347,7 +395,7 @@ export function ChatBox({
                   ? "发送消息... (Enter 发送, Shift+Enter 换行)"
                   : "后端服务未启动..."
               }
-              className="flex-1 min-h-[52px] max-h-[200px] px-4 py-3.5 bg-transparent text-foreground placeholder:text-muted-foreground resize-none focus:outline-none text-sm leading-relaxed pr-14 rounded-xl"
+              className="flex-1 min-h-[52px] max-h-[200px] px-4 py-3.5 bg-transparent text-foreground placeholder:text-muted-foreground resize-none focus:outline-none text-sm leading-relaxed pr-24 pl-14 rounded-xl"
               disabled={isLoading || !isBackendAvailable}
               rows={1}
               style={{
@@ -362,10 +410,10 @@ export function ChatBox({
             <Button
               type="submit"
               size="icon"
-              disabled={!input.trim() || isLoading || !isBackendAvailable}
+              disabled={(!input.trim() && !selectedImageData) || isLoading || !isBackendAvailable}
               className={cn(
                 "absolute right-2 bottom-2 transition-all duration-200 h-8 w-8",
-                input.trim() && !isLoading && isBackendAvailable
+                (input.trim() || selectedImageData) && !isLoading && isBackendAvailable
                   ? "bg-primary text-primary-foreground hover:bg-primary/90 shadow-sm"
                   : "bg-muted text-muted-foreground cursor-not-allowed hover:bg-muted"
               )}
@@ -378,7 +426,7 @@ export function ChatBox({
             </Button>
           </div>
           <p className="text-[10px] text-muted-foreground mt-2 text-center opacity-70">
-            由 Qwen2.5-7B 驱动 · 支持知识库检索
+            由 Qwen2.5-7B 驱动 · 支持知识库检索与图片理解
           </p>
         </form>
       </div>

@@ -1,9 +1,13 @@
 """Chat API endpoints.
 
 Handles streaming and non-streaming chat responses with RAG support.
+Multimodal support for image understanding using BLIP-2 vision model.
 """
+import base64
 import json
+import re
 import uuid
+import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
@@ -22,6 +26,13 @@ from app.services.session_service import (
     clear_all_sessions,
 )
 from app.services.rag_service import verify_content_relevance
+from app.services.vision_service import (
+    analyze_image_content,
+    is_vision_available,
+    get_supported_formats,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -106,8 +117,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
 async def chat_stream(request: ChatRequest):
     """Process a chat request with streaming response.
 
+    Supports multimodal input when an image is provided in the request.
+
     Args:
-        request: Chat request with message and session info
+        request: Chat request with message, optional image, and session info
 
     Returns:
         Streaming SSE response with generated tokens
@@ -122,12 +135,81 @@ async def chat_stream(request: ChatRequest):
     # Create or use existing session
     session_id = request.session_id or create_session()
 
-    # Add user message to history
-    add_message(session_id, "user", request.message)
+    # ==================== MULTIMODAL IMAGE PROCESSING ====================
+    image_context = ""
+    has_image = False
+
+    if request.image:
+        try:
+            logger.info(f"Image data received, length: {len(request.image)}")
+            # Decode base64 image
+            image_bytes = base64.b64decode(request.image)
+
+            # Check if vision service is available (GLM-4V API or local model)
+            if is_vision_available():
+                # Generate image description using GLM-4V API
+                logger.info("Processing image with GLM-4V API...")
+                try:
+                    image_context = await analyze_image_content(
+                        image_bytes,
+                        user_question=request.message,
+                    )
+                    has_image = True
+                    logger.info(f"Image context generated: {len(image_context)} chars")
+                except RuntimeError as vision_error:
+                    # Vision API unavailable - graceful degradation
+                    logger.warning(f"Vision service unavailable: {vision_error}, continuing without image analysis")
+                    image_context = ""
+                except Exception as e:
+                    logger.error(f"Vision processing failed: {e}", exc_info=True)
+                    # Continue without image context rather than failing
+                    image_context = ""
+            else:
+                logger.warning("Vision service not available, skipping image analysis")
+                image_context = ""
+
+        except Exception as e:
+            logger.error(f"Image decode/processing failed: {e}", exc_info=True)
+            # Continue without image context rather than failing
+            image_context = ""
+    # ====================================================================
+
+    # Prepare image data for history storage
+    image_data_to_store = None
+    image_format_to_store = None
+
+    if request.image:
+        try:
+            logger.info(f"Image data received, length: {len(request.image)}")
+            # Decode base64 image
+            image_bytes = base64.b64decode(request.image)
+
+            # Extract format from data URL (e.g., "data:image/png;base64,...")
+            import re
+            if "image/" in request.image:
+                match = re.search(r"data:image/([a-zA-Z+]+);base64,", request.image)
+                image_format_to_store = match.group(1) if match else "png"
+
+            # Store image data for message history
+            image_data_to_store = request.image
+        except Exception as e:
+            logger.error(f"Image decode failed: {e}", exc_info=True)
+
+    # ====================================================================
+
+    # Add user message to history (with image data)
+    add_message(
+        session_id,
+        "user",
+        request.message,
+        has_image=bool(image_data_to_store),
+        image_data=image_data_to_store,
+        image_format=image_format_to_store
+    )
 
     # Retrieve relevant documents
     sources = []
-    context = ""
+    rag_context = ""
     has_relevant_context = False
 
     if not request.use_search:
@@ -145,7 +227,7 @@ async def chat_stream(request: ChatRequest):
                 has_relevant_context = score_check and content_check
 
                 if has_relevant_context:
-                    context = get_context(documents)
+                    rag_context = get_context(documents)
                     sources = [
                         {
                             "content": doc.content[:200] + "...",
@@ -156,8 +238,14 @@ async def chat_stream(request: ChatRequest):
                     ]
         except Exception as e:
             # RAG failed, continue without context
-            import logging
-            logging.warning(f"RAG retrieval failed: {e}, continuing without context")
+            logger.warning(f"RAG retrieval failed: {e}, continuing without context")
+
+    # Combine contexts: image context + RAG context
+    combined_context = ""
+    if image_context:
+        combined_context += image_context + "\n\n"
+    if rag_context:
+        combined_context += rag_context
 
     async def event_generator():
         """Generate SSE events for streaming response."""
@@ -168,13 +256,15 @@ async def chat_stream(request: ChatRequest):
                 "data": json.dumps({
                     "session_id": session_id,
                     "sources": sources,
-                    "has_context": bool(context),
+                    "has_context": bool(combined_context),
+                    "has_image": has_image,
                 }),
             }
 
-            # Stream response (hybrid mode: use RAG when available, free chat otherwise)
+            # Stream response (hybrid mode: use combined context when available)
             full_response = ""
-            async for token in astream_response(request.message, context):
+            effective_question = request.message
+            async for token in astream_response(effective_question, combined_context):
                 full_response += token
                 yield {
                     "event": "token",

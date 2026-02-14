@@ -2,6 +2,10 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   timestamp?: Date;
+  // Multimodal support
+  has_image?: boolean;
+  image_data?: string;  // Base64 encoded image
+  image_format?: string;  // Image format (png, jpeg, etc.)
 }
 
 export interface SourceDocument {

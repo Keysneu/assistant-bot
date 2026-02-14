@@ -1,7 +1,7 @@
 import * as React from "react"
 import { X, CheckCircle, AlertCircle, Info } from "lucide-react"
 import { cn } from "../../lib/utils"
-import { ToastProps } from "../../hooks/use-toast"
+import type { ToastProps } from "../../hooks/use-toast"
 
 const Toast = React.forwardRef<
   HTMLDivElement,

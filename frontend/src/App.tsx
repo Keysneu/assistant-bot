@@ -22,6 +22,7 @@ const DocumentManager = lazy(() => import("./components/DocumentManager").then(m
 import { useSessions } from "./hooks/useSessions";
 import { cn } from "./lib/utils";
 import { Button } from "./components/ui/Button";
+import { Toaster } from "./components/ui/Toaster";
 
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -255,6 +256,7 @@ function App() {
           </Suspense>
         </div>
       </main>
+      <Toaster />
     </div>
   );
 }

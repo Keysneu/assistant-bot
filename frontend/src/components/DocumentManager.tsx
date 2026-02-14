@@ -28,6 +28,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "./ui/
 import { Input, FloatingLabelInput } from "./ui/Input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "./ui/Dialog";
 import { cn } from "../lib/utils";
+import { useToast } from "../hooks/use-toast";
 
 interface DocumentManagerProps {
   onDocumentsChange?: () => void;

@@ -2,7 +2,11 @@
 
 Optimized for Mac M3 Neural Engine acceleration.
 """
+import os
 from typing import List
+
+# 设置 HuggingFace 国内镜像加速下载
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
 from sentence_transformers import SentenceTransformer
 from app.core.config import settings

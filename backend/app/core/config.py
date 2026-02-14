@@ -34,6 +34,19 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "thenlper/gte-large"
     EMBEDDING_DEVICE: str = "mps"  # Apple Silicon Neural Engine
 
+    # Vision Model Settings
+    # Choice: "glm" for GLM-4V API (recommended, no local model), "local" for BLIP-2
+    VISION_BACKEND: str = "glm"  # "glm" or "local"
+
+    # GLM-4V API Settings (智谱 AI)
+    GLM_API_KEY: str = ""  # 智谱 AI API Key
+    GLM_VISION_MODEL: str = "glm-4v-flash"  # glm-4v-flash (免费), glm-4v (付费), glm-4v-plus (高级)
+
+    # Local BLIP-2 Settings (fallback, ~15GB download)
+    VISION_MODEL: str = "Salesforce/blip2-opt-2.7b"
+    VISION_DEVICE: str = "mps"  # Apple Silicon Neural Engine
+    VISION_MAX_LENGTH: int = 50  # Max caption length
+
     # ChromaDB Settings
     CHROMA_PERSIST_DIR: str = "./data/chroma_db"
     COLLECTION_NAME: str = "documents"
@@ -47,6 +60,7 @@ class Settings(BaseSettings):
 
     # External APIs
     METAPHOR_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
 
     # Prompt Template (Qwen2.5 format - Hybrid RAG + Free Chat mode)
     # 混合模式：优先使用知识库，没有则自由回答

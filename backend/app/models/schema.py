@@ -1,7 +1,7 @@
 """Pydantic models for request/response validation."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, Field
 
 
@@ -12,6 +12,10 @@ class ChatMessage(BaseModel):
     role: str = Field(..., description="Message role: 'user' or 'assistant'")
     content: str = Field(..., description="Message content")
     timestamp: Optional[datetime] = None
+    # Multimodal support
+    has_image: bool = Field(False, description="Whether this message contains an image")
+    image_data: Optional[str] = Field(None, description="Base64 encoded image data")
+    image_format: Optional[str] = Field(None, description="Image format (png, jpeg, webp, etc.)")
 
 
 class ChatRequest(BaseModel):
@@ -21,6 +25,12 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Session identifier for conversation history")
     use_search: bool = Field(False, description="Whether to use web search")
     stream: bool = Field(True, description="Whether to stream the response")
+    # Multimodal support
+    image: Optional[str] = Field(None, description="Base64 encoded image data (optional)")
+    image_format: Optional[str] = Field(
+        None,
+        description="Image format/extension (png, jpeg, jpg, webp, gif, etc.)"
+    )
 
 
 class SessionTitleRequest(BaseModel):

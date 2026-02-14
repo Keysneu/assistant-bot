@@ -26,6 +26,20 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+  // Multimodal support
+  has_image?: boolean;
+  image_data?: string;
+  image_format?: string;
+}
+
+// Multimodal chat request with optional image
+export interface MultimodalChatRequest {
+  message: string;
+  session_id?: string;
+  use_search?: boolean;
+  stream?: boolean;
+  image?: string;  // Base64 encoded image
+  image_format?: string;  // Image format (png, jpeg, webp, gif)
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -69,15 +83,36 @@ export async function sendMessage(message: string, sessionId?: string) {
 export async function* streamMessage(
   message: string,
   sessionId?: string,
+  imageData?: string,
+  imageFormat?: string,
 ): AsyncGenerator<string, void, unknown> {
+  // When image is provided but message is empty, use a space as placeholder
+  const effectiveMessage = (message.trim() || (imageData && imageData.trim())) ? message.trim() : " ";
+
+  const requestBody: MultimodalChatRequest = {
+    message: effectiveMessage,
+    session_id: sessionId,
+  };
+
+  // Add image data if provided
+  if (imageData && imageData.trim()) {
+    requestBody.image = imageData;
+    requestBody.image_format = imageFormat || "png";
+  }
+
+  console.log("Sending request:", requestBody);
+
   const response = await fetch(API.stream, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      session_id: sessionId,
-    }),
+    body: JSON.stringify(requestBody),
   });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error("API Error:", response.status, errorText);
+    throw new Error(`API Error ${response.status}: ${errorText}`);
+  }
 
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
