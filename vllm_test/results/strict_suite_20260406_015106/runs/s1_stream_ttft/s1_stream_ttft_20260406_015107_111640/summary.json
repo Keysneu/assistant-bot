@@ -1,0 +1,33 @@
+{
+  "generated_at": "2026-04-06T01:51:45",
+  "config": {
+    "base_url": "http://127.0.0.1:8100/v1",
+    "model": "gemma4-e4b-it",
+    "requests": 120,
+    "concurrency": 8,
+    "stream": true,
+    "max_tokens": 256,
+    "timeout": 180.0,
+    "warmup": 1
+  },
+  "metrics": {
+    "total_requests": 120,
+    "success": 120,
+    "failed": 0,
+    "success_rate_percent": 100.0,
+    "benchmark_elapsed_s": 36.061,
+    "avg_latency_s": 2.395,
+    "p50_latency_s": 2.386,
+    "p90_latency_s": 2.431,
+    "p95_latency_s": 2.438,
+    "max_latency_s": 2.497,
+    "avg_ttft_s": 0.108,
+    "p95_ttft_s": 0.165,
+    "request_throughput_rps": 3.328,
+    "success_throughput_rps": 3.328,
+    "completion_token_throughput_tps": 851.892,
+    "sum_prompt_tokens": 3840,
+    "sum_completion_tokens": 30720,
+    "sum_total_tokens": 34560
+  }
+}

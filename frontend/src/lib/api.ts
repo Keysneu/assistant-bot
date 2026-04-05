@@ -2,6 +2,10 @@ import type {
   HealthResponse,
   DocumentListResponse,
   DocumentDeleteResponse,
+  DocumentUploadResponse,
+  DocumentBatchUploadResponse,
+  PerformanceOverviewResponse,
+  ChatModeConfigResponse,
 } from "../types";
 
 // Session types
@@ -30,6 +34,11 @@ export interface ChatMessage {
   has_image?: boolean;
   image_data?: string;
   image_format?: string;
+  has_file?: boolean;
+  file_name?: string;
+  file_format?: string;
+  reasoning_content?: string;
+  final_content?: string;
 }
 
 // Multimodal chat request with optional image
@@ -40,6 +49,12 @@ export interface MultimodalChatRequest {
   stream?: boolean;
   image?: string;  // Base64 encoded image
   image_format?: string;  // Image format (png, jpeg, webp, gif)
+  file?: string;  // Base64 encoded file
+  file_name?: string;
+  file_format?: string;
+  enable_thinking?: boolean;
+  enable_tool_calling?: boolean;
+  deploy_profile?: string;
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -47,6 +62,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 export const API = {
   chat: `${API_BASE_URL}/api/chat/`,
   stream: `${API_BASE_URL}/api/chat/stream`,
+  chatModeConfig: `${API_BASE_URL}/api/chat/mode-config`,
   sessions: `${API_BASE_URL}/api/chat/sessions`,
   session: (id: string) => `${API_BASE_URL}/api/chat/sessions/${id}`,
   history: (id: string) => `${API_BASE_URL}/api/chat/history/${id}`,
@@ -54,16 +70,46 @@ export const API = {
   updateTitle: (id: string) => `${API_BASE_URL}/api/chat/sessions/${id}/title`,
   clearSessions: `${API_BASE_URL}/api/chat/sessions`,
   upload: `${API_BASE_URL}/api/documents/upload`,
+  uploadBatch: `${API_BASE_URL}/api/documents/upload-batch`,
   ingestUrl: `${API_BASE_URL}/api/documents/ingest-url`,
   docs: `${API_BASE_URL}/api/documents/stats`,
   docsList: `${API_BASE_URL}/api/documents/list`,
   deleteDoc: (id: string) => `${API_BASE_URL}/api/documents/${id}`,
   clear: `${API_BASE_URL}/api/documents/clear`,
   health: `${API_BASE_URL}/api/health/`,
+  performanceOverview: `${API_BASE_URL}/api/performance/overview`,
 };
 
 export async function healthCheck(): Promise<HealthResponse> {
   const response = await fetch(API.health);
+  return response.json();
+}
+
+export async function getPerformanceOverview(): Promise<PerformanceOverviewResponse> {
+  const response = await fetch(API.performanceOverview);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch performance overview: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function getChatModeConfig(): Promise<ChatModeConfigResponse> {
+  const response = await fetch(API.chatModeConfig);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch chat mode config: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function updateChatModeConfig(deployProfile: string): Promise<ChatModeConfigResponse> {
+  const response = await fetch(API.chatModeConfig, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deploy_profile: deployProfile }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to update chat mode config: ${response.status} ${await response.text()}`);
+  }
   return response.json();
 }
 
@@ -85,22 +131,71 @@ export async function* streamMessage(
   sessionId?: string,
   imageData?: string,
   imageFormat?: string,
+  fileData?: string,
+  fileName?: string,
+  fileFormat?: string,
+  enableThinking?: boolean,
+  enableToolCalling?: boolean,
+  deployProfile?: string,
+  onMetadata?: (metadata: {
+    session_id?: string;
+    sources?: Array<Record<string, unknown>>;
+    has_context?: boolean;
+    has_image?: boolean;
+    has_file?: boolean;
+    multimodal_mode?: string;
+    deploy_profile?: string;
+    requested_deploy_profile?: string;
+    profile_source?: string;
+    enable_thinking?: boolean;
+    enable_tool_calling?: boolean;
+    requested_enable_thinking?: boolean;
+    requested_enable_tool_calling?: boolean;
+    mode_warnings?: string[];
+  }) => void,
+  onDone?: (done: {
+    session_id?: string;
+    full_content?: string;
+    display_content?: string;
+    reasoning_content?: string | null;
+    final_content?: string | null;
+  }) => void,
 ): AsyncGenerator<string, void, unknown> {
-  // When image is provided but message is empty, use a space as placeholder
-  const effectiveMessage = (message.trim() || (imageData && imageData.trim())) ? message.trim() : " ";
+  const hasImage = Boolean(imageData && imageData.trim());
+  const hasFile = Boolean(fileData && fileData.trim());
+  const trimmedMessage = message.trim();
+  // Keep image-only requests valid for backend schema and model prompt.
+  const effectiveMessage = trimmedMessage || (hasImage ? "请描述这张图片" : (hasFile ? "请阅读并总结这个文件的重点" : " "));
 
   const requestBody: MultimodalChatRequest = {
     message: effectiveMessage,
     session_id: sessionId,
+    enable_thinking: Boolean(enableThinking),
+    enable_tool_calling: Boolean(enableToolCalling),
+    deploy_profile: deployProfile,
   };
 
   // Add image data if provided
-  if (imageData && imageData.trim()) {
+  if (hasImage) {
     requestBody.image = imageData;
     requestBody.image_format = imageFormat || "png";
   }
+  if (hasFile) {
+    requestBody.file = fileData;
+    requestBody.file_name = fileName;
+    requestBody.file_format = fileFormat;
+  }
 
-  console.log("Sending request:", requestBody);
+  console.debug("Sending chat stream request", {
+    session_id: sessionId,
+    has_image: hasImage,
+    has_file: hasFile,
+    enable_thinking: Boolean(enableThinking),
+    enable_tool_calling: Boolean(enableToolCalling),
+    image_chars: imageData?.length ?? 0,
+    file_chars: fileData?.length ?? 0,
+    message_chars: effectiveMessage.length,
+  });
 
   const response = await fetch(API.stream, {
     method: "POST",
@@ -123,7 +218,6 @@ export async function* streamMessage(
 
   let buffer = "";
   let currentEvent = "";
-  const sessionIdRef = { current: sessionId };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -145,10 +239,15 @@ export async function* streamMessage(
         try {
           const parsed = JSON.parse(data);
           if (currentEvent === "metadata") {
-            sessionIdRef.current = parsed.session_id;
+            if (onMetadata) {
+              onMetadata(parsed);
+            }
           } else if (currentEvent === "token") {
             yield parsed.token || "";
           } else if (currentEvent === "done") {
+            if (onDone) {
+              onDone(parsed);
+            }
             return;
           } else if (currentEvent === "error") {
             throw new Error(parsed.error || "Unknown error");
@@ -161,7 +260,7 @@ export async function* streamMessage(
   }
 }
 
-export async function uploadDocument(file: File) {
+export async function uploadDocument(file: File): Promise<DocumentUploadResponse> {
   const formData = new FormData();
   formData.append("file", file);
 
@@ -169,6 +268,29 @@ export async function uploadDocument(file: File) {
     method: "POST",
     body: formData,
   });
+  if (!response.ok) {
+    throw new Error(`上传失败: ${response.status} ${await response.text()}`);
+  }
+  return response.json();
+}
+
+export async function uploadDocuments(files: File[]): Promise<DocumentBatchUploadResponse> {
+  if (!files.length) {
+    throw new Error("No files provided");
+  }
+
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append("files", file);
+  }
+
+  const response = await fetch(API.uploadBatch, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(`批量上传失败: ${response.status} ${await response.text()}`);
+  }
   return response.json();
 }
 

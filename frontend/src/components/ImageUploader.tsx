@@ -1,19 +1,73 @@
 import { useState, useRef } from "react";
-import { X, Image as ImageIcon, Sparkles, Plus } from "lucide-react";
+import { X, Image as ImageIcon, Sparkles } from "lucide-react";
 import { cn } from "../lib/utils";
 
 interface ImageUploaderProps {
   onImageSelect: (imageData: string, format: string) => void;
   disabled?: boolean;
+  disabledReason?: string;
 }
 
-export function ImageUploader({ onImageSelect, disabled }: ImageUploaderProps) {
+export function ImageUploader({ onImageSelect, disabled, disabledReason }: ImageUploaderProps) {
   const [preview, setPreview] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const MAX_EDGE = 1536;
+  const TARGET_MIME = "image/jpeg";
+  const TARGET_QUALITY = 0.85;
 
-  const handleFileSelect = (file: File | null) => {
+  const readFileAsDataURL = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result;
+        if (typeof result === "string") {
+          resolve(result);
+        } else {
+          reject(new Error("读取图片失败"));
+        }
+      };
+      reader.onerror = () => reject(new Error("读取图片失败"));
+      reader.readAsDataURL(file);
+    });
+
+  const loadImage = (src: string): Promise<HTMLImageElement> =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("图片解码失败"));
+      img.src = src;
+    });
+
+  const normalizeImage = async (file: File): Promise<{ dataUrl: string; format: string }> => {
+    const originalDataUrl = await readFileAsDataURL(file);
+    const img = await loadImage(originalDataUrl);
+
+    const maxSide = Math.max(img.width, img.height);
+    const scale = maxSide > MAX_EDGE ? MAX_EDGE / maxSide : 1;
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("浏览器不支持 Canvas");
+    }
+
+    ctx.drawImage(img, 0, 0, width, height);
+    const compressedDataUrl = canvas.toDataURL(TARGET_MIME, TARGET_QUALITY);
+
+    return {
+      dataUrl: compressedDataUrl,
+      format: "jpeg",
+    };
+  };
+
+  const handleFileSelect = async (file: File | null) => {
     if (!file) return;
 
     if (!file.type.startsWith("image/")) {
@@ -26,19 +80,15 @@ export function ImageUploader({ onImageSelect, disabled }: ImageUploaderProps) {
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const result = e.target?.result as string;
-      if (result) {
-        const formatMatch = result.match(/data:image\/([a-zA-Z+]+);base64/);
-        const format = formatMatch ? formatMatch[1] : "png";
-        const base64Data = result.split(",")[1];
-
-        setPreview(result);
-        onImageSelect(base64Data, format);
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const { dataUrl, format } = await normalizeImage(file);
+      const base64Data = dataUrl.split(",")[1];
+      setPreview(dataUrl);
+      onImageSelect(base64Data, format);
+    } catch (error) {
+      console.error("图片处理失败:", error);
+      alert("图片处理失败，请尝试其他图片");
+    }
   };
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -69,6 +119,8 @@ export function ImageUploader({ onImageSelect, disabled }: ImageUploaderProps) {
     }
     onImageSelect("", "");
   };
+
+  const buttonTitle = disabled && disabledReason ? disabledReason : "添加图片";
 
   return (
     <div className="relative">
@@ -152,7 +204,7 @@ export function ImageUploader({ onImageSelect, disabled }: ImageUploaderProps) {
             // 禁用状态
             disabled && "opacity-40 cursor-not-allowed hover:scale-100 hover:shadow-md hover:border-input hover:bg-muted"
           )}
-          title="添加图片"
+          title={buttonTitle}
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
         >

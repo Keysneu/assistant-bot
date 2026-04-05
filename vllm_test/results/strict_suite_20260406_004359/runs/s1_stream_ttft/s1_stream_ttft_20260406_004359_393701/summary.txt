@@ -1,0 +1,21 @@
+[Summary]
+total_requests=120
+success=120
+failed=0
+success_rate=100.00%
+benchmark_elapsed=36.695s
+avg_latency=2.444s
+p50_latency=2.378s
+p90_latency=2.410s
+p95_latency=3.346s
+max_latency=3.354s
+avg_ttft=0.168s
+p95_ttft=1.077s
+request_throughput=3.270 req/s
+success_throughput=3.270 req/s
+completion_token_throughput=837.175 tok/s
+sum_prompt_tokens=3840
+sum_completion_tokens=30720
+sum_total_tokens=34560
+requests_log=vllm_test/results/strict_suite_20260406_004359/runs/s1_stream_ttft/s1_stream_ttft_20260406_004359_393701/requests.jsonl
+summary_json=vllm_test/results/strict_suite_20260406_004359/runs/s1_stream_ttft/s1_stream_ttft_20260406_004359_393701/summary.json

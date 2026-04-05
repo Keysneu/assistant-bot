@@ -1,0 +1,243 @@
+{
+  "generated_at": "2026-04-06T00:49:27",
+  "suite_dir": "vllm_test/results/strict_suite_20260406_004359",
+  "config": {
+    "base_url": "http://127.0.0.1:8100/v1",
+    "model": "gemma4-e4b-it",
+    "timeout": 180.0,
+    "temperature": 0.2,
+    "warmup": 1,
+    "soak_requests": 320
+  },
+  "summary": {
+    "total": 4,
+    "pass": 2,
+    "fail": 2,
+    "skipped": 0,
+    "overall": "FAIL"
+  },
+  "results": [
+    {
+      "scenario": {
+        "name": "s1_stream_ttft",
+        "description": "Stream responsiveness and TTFT stability.",
+        "prompt": "请用结构化方式解释RAG系统在企业知识库中的价值，并给出3个落地指标。",
+        "requests": 120,
+        "concurrency": 8,
+        "max_tokens": 256,
+        "stream": true,
+        "rules": [
+          {
+            "metric": "success_rate_percent",
+            "op": ">=",
+            "threshold": 99.0
+          },
+          {
+            "metric": "p95_latency_s",
+            "op": "<=",
+            "threshold": 3.0
+          },
+          {
+            "metric": "p95_ttft_s",
+            "op": "<=",
+            "threshold": 0.2
+          },
+          {
+            "metric": "completion_token_throughput_tps",
+            "op": ">=",
+            "threshold": 600.0
+          }
+        ]
+      },
+      "returncode": 0,
+      "status": "FAIL",
+      "run_dir": "vllm_test/results/strict_suite_20260406_004359/runs/s1_stream_ttft/s1_stream_ttft_20260406_004359_393701",
+      "summary_json": "vllm_test/results/strict_suite_20260406_004359/runs/s1_stream_ttft/s1_stream_ttft_20260406_004359_393701/summary.json",
+      "metrics": {
+        "total_requests": 120,
+        "success": 120,
+        "failed": 0,
+        "success_rate_percent": 100.0,
+        "benchmark_elapsed_s": 36.695,
+        "avg_latency_s": 2.444,
+        "p50_latency_s": 2.378,
+        "p90_latency_s": 2.41,
+        "p95_latency_s": 3.346,
+        "max_latency_s": 3.354,
+        "avg_ttft_s": 0.168,
+        "p95_ttft_s": 1.077,
+        "request_throughput_rps": 3.27,
+        "success_throughput_rps": 3.27,
+        "completion_token_throughput_tps": 837.175,
+        "sum_prompt_tokens": 3840,
+        "sum_completion_tokens": 30720,
+        "sum_total_tokens": 34560
+      },
+      "rule_failures": [
+        "p95_latency_s actual=3.346 required <= 3.000",
+        "p95_ttft_s actual=1.077 required <= 0.200"
+      ]
+    },
+    {
+      "scenario": {
+        "name": "s2_high_concurrency",
+        "description": "High-concurrency stress under non-stream mode.",
+        "prompt": "请用200字总结检索增强生成在大型知识库问答中的优势与局限。",
+        "requests": 240,
+        "concurrency": 16,
+        "max_tokens": 256,
+        "stream": false,
+        "rules": [
+          {
+            "metric": "success_rate_percent",
+            "op": ">=",
+            "threshold": 99.0
+          },
+          {
+            "metric": "p95_latency_s",
+            "op": "<=",
+            "threshold": 4.5
+          },
+          {
+            "metric": "completion_token_throughput_tps",
+            "op": ">=",
+            "threshold": 650.0
+          }
+        ]
+      },
+      "returncode": 0,
+      "status": "FAIL",
+      "run_dir": "vllm_test/results/strict_suite_20260406_004359/runs/s2_high_concurrency/s2_high_concurrency_20260406_004438_362460",
+      "summary_json": "vllm_test/results/strict_suite_20260406_004359/runs/s2_high_concurrency/s2_high_concurrency_20260406_004438_362460/summary.json",
+      "metrics": {
+        "total_requests": 240,
+        "success": 240,
+        "failed": 0,
+        "success_rate_percent": 100.0,
+        "benchmark_elapsed_s": 68.207,
+        "avg_latency_s": 4.43,
+        "p50_latency_s": 4.501,
+        "p90_latency_s": 4.667,
+        "p95_latency_s": 4.689,
+        "max_latency_s": 4.721,
+        "avg_ttft_s": 0.0,
+        "p95_ttft_s": 0.0,
+        "request_throughput_rps": 3.519,
+        "success_throughput_rps": 3.519,
+        "completion_token_throughput_tps": 862.115,
+        "sum_prompt_tokens": 7440,
+        "sum_completion_tokens": 58802,
+        "sum_total_tokens": 66242
+      },
+      "rule_failures": [
+        "p95_latency_s actual=4.689 required <= 4.500"
+      ]
+    },
+    {
+      "scenario": {
+        "name": "s3_long_generation",
+        "description": "Long-generation pressure with larger max tokens.",
+        "prompt": "请写一份企业RAG系统建设指南，包含架构、分层、索引策略、缓存策略、质量评估、线上监控与灰度发布建议，要求分点输出。",
+        "requests": 96,
+        "concurrency": 8,
+        "max_tokens": 1024,
+        "stream": false,
+        "rules": [
+          {
+            "metric": "success_rate_percent",
+            "op": ">=",
+            "threshold": 98.0
+          },
+          {
+            "metric": "p95_latency_s",
+            "op": "<=",
+            "threshold": 12.0
+          },
+          {
+            "metric": "completion_token_throughput_tps",
+            "op": ">=",
+            "threshold": 500.0
+          }
+        ]
+      },
+      "returncode": 0,
+      "status": "PASS",
+      "run_dir": "vllm_test/results/strict_suite_20260406_004359/runs/s3_long_generation/s3_long_generation_20260406_004548_681319",
+      "summary_json": "vllm_test/results/strict_suite_20260406_004359/runs/s3_long_generation/s3_long_generation_20260406_004548_681319/summary.json",
+      "metrics": {
+        "total_requests": 96,
+        "success": 96,
+        "failed": 0,
+        "success_rate_percent": 100.0,
+        "benchmark_elapsed_s": 113.55,
+        "avg_latency_s": 9.46,
+        "p50_latency_s": 9.457,
+        "p90_latency_s": 9.514,
+        "p95_latency_s": 9.545,
+        "max_latency_s": 9.562,
+        "avg_ttft_s": 0.0,
+        "p95_ttft_s": 0.0,
+        "request_throughput_rps": 0.845,
+        "success_throughput_rps": 0.845,
+        "completion_token_throughput_tps": 865.735,
+        "sum_prompt_tokens": 4512,
+        "sum_completion_tokens": 98304,
+        "sum_total_tokens": 102816
+      },
+      "rule_failures": []
+    },
+    {
+      "scenario": {
+        "name": "s4_soak_stream",
+        "description": "Longer stream soak to detect stability regressions.",
+        "prompt": "请用简洁语言给出RAG在客服、法务、研发支持三个场景的实施建议。",
+        "requests": 320,
+        "concurrency": 8,
+        "max_tokens": 256,
+        "stream": true,
+        "rules": [
+          {
+            "metric": "success_rate_percent",
+            "op": ">=",
+            "threshold": 99.0
+          },
+          {
+            "metric": "p95_latency_s",
+            "op": "<=",
+            "threshold": 3.5
+          },
+          {
+            "metric": "p95_ttft_s",
+            "op": "<=",
+            "threshold": 0.25
+          }
+        ]
+      },
+      "returncode": 0,
+      "status": "PASS",
+      "run_dir": "vllm_test/results/strict_suite_20260406_004359/runs/s4_soak_stream/s4_soak_stream_20260406_004750_110391",
+      "summary_json": "vllm_test/results/strict_suite_20260406_004359/runs/s4_soak_stream/s4_soak_stream_20260406_004750_110391/summary.json",
+      "metrics": {
+        "total_requests": 320,
+        "success": 320,
+        "failed": 0,
+        "success_rate_percent": 100.0,
+        "benchmark_elapsed_s": 95.753,
+        "avg_latency_s": 2.391,
+        "p50_latency_s": 2.389,
+        "p90_latency_s": 2.407,
+        "p95_latency_s": 2.413,
+        "max_latency_s": 2.436,
+        "avg_ttft_s": 0.1,
+        "p95_ttft_s": 0.113,
+        "request_throughput_rps": 3.342,
+        "success_throughput_rps": 3.342,
+        "completion_token_throughput_tps": 855.537,
+        "sum_prompt_tokens": 9600,
+        "sum_completion_tokens": 81920,
+        "sum_total_tokens": 91520
+      },
+      "rule_failures": []
+    }
+  ]
+}

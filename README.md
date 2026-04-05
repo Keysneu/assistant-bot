@@ -1,434 +1,304 @@
 # AssistantBot
 
-<div align="center">
-
-![AssistantBot](https://img.shields.io/badge/AssistantBot-v0.1.0-blue)
-![Python](https://img.shields.io/badge/Python-3.10+-green)
-![React](https://img.shields.io/badge/React-19-cyan)
-![License](https://img.shields.io/badge/License-MIT-yellow)
-
-**基于 RAG 的本地智能对话助手**
-
-专为 Mac M3 优化的全栈私有知识库对话系统
-
-[功能特性](#功能特性) • [快速开始](#快速开始) • [技术架构](#技术架构) • [开发指南](#开发指南)
-
-</div>
-
----
+AssistantBot 是一个面向本地部署的全栈 RAG 对话系统，目标是把实验型 Notebook 代码演进为工程化产品。项目针对 Apple Silicon（Mac M3）做了推理与向量化加速优化，支持私有知识库问答、流式对话、会话管理、多模态图片输入和对话附件文件直读。
 
 ## 项目简介
 
-AssistantBot 是一个工业级的 RAG（检索增强生成）对话系统，完全运行在本地，保障数据隐私。项目利用 Mac M3 的 Metal GPU 加速能力，实现了高性能的本地 LLM 推理，配合 ChromaDB 向量数据库和 React 现代化前端，提供 ChatGPT 级别的交互体验。
+本项目解决的问题：
+- 将“文档检索 + 大模型回答”落地为可运行的前后端系统。
+- 在本地环境中实现数据可控、可持续迭代的知识库助手。
+- 提供接近生产形态的 API 分层、服务分层与前端交互。
 
-### 核心亮点
+当前能力（基于仓库现状）：
+- FastAPI 后端（健康检查、聊天、文档上传/URL 导入、会话管理）。
+- ChromaDB 本地持久化检索。
+- llama-cpp-python 本地模型推理（支持 Metal 参数）。
+- vLLM 远程推理接入（OpenAI-Compatible，支持流式/非流式）。
+- 对话附件文件直读（`txt/md/pdf/csv/json/log`，不入库，按单次会话上下文注入）。
+- 项目内 Gemma4 性能展示面板（聚合 benchmark/strict/probe 最新结果）。
+- SSE 流式输出与多会话管理。
+- 前端 React + Vite + Tailwind 聊天与文档管理 UI。
 
-- **完全本地运行**：无需联网，所有数据和模型均在本地处理，保障隐私安全
-- **Mac M3 优化**：充分利用 Metal GPU 加速，推理速度提升 3-5 倍
-- **混合问答模式**：优先使用知识库内容，无相关内容时自动切换为自由对话
-- **流式响应**：SSE 实时流式输出，用户体验流畅
-- **多格式支持**：支持 TXT、PDF、MD、HTML 等多种文档格式
-- **会话管理**：支持多会话管理、历史记录查看与切换
+## 最新进展（2026-04-06）
 
----
+- Gemma4 部署能力增强（对齐 vLLM 官方 Gemma4 recipe 配置建议）：
+  - `deploy/vllm/start_vllm.sh` 新增 `DEPLOY_PROFILE` 档位（`rag_text/vision/full/benchmark`）
+  - 新增 thinking/tool calling 开关：`ENABLE_REASONING`、`ENABLE_TOOL_CALLING`
+  - 新增压测一致性开关：`DISABLE_PREFIX_CACHING`（`benchmark` 档位自动启用）
+- 新增 Gemma4 能力探测脚本：
+  - `vllm_test/probe_gemma4_capabilities.py`
+  - 可验证 `models/text/multimodal/structured/thinking/tool_calling`
+- 新增项目内性能适配（后端 API + 前端页面）：
+  - 后端新增 `GET /api/performance/overview`
+  - 前端新增“性能”Tab，直接展示 Gemma4 关键指标
+- 新增项目内模式切换（用户自主选择）：
+  - 聊天请求支持 `enable_thinking`、`enable_tool_calling`
+  - 聊天输入框新增 Thinking / Tool Calling 开关按钮
+  - Tool Calling 当前内置工具：`get_current_time`、`math_calculator`
+- 新增“对话附件上传并直读”能力（你要求的“像图片一样上传文件给 AI 读”）：
+  - 聊天请求支持文件字段：`file/file_name/file_format`
+  - 后端支持 `txt/md/pdf/csv/json/log` 解析并注入当次对话上下文
+  - 前端聊天框新增附件按钮，支持上传文件并随消息发送
 
-## 功能特性
+## 技术栈
 
-### 对话功能
-- 🤖 **智能问答**：基于上传文档的智能检索与回答
-- 💬 **多轮对话**：支持上下文理解的连续对话
-- 🔄 **流式输出**：实时显示 AI 回复过程
-- 📝 **会话管理**：创建、切换、删除多个对话会话
+后端：
+- Python 3.10+
+- FastAPI / Uvicorn
+- llama-cpp-python
+- sentence-transformers（`thenlper/gte-large`）
+- ChromaDB
+- pypdf / BeautifulSoup / httpx
+- sse-starlette
 
-### 知识库功能
-- 📄 **文档上传**：支持拖拽上传本地文档
-- 🌐 **URL 导入**：支持直接抓取网页内容
-- 📊 **向量存储**：基于 ChromaDB 的持久化向量检索
-- 🗑️ **文档管理**：查看、删除已上传的文档
+前端：
+- React 19 + TypeScript
+- Vite
+- Tailwind CSS
+- lucide-react
+- react-markdown + remark-gfm
 
-### 支持的文档格式
-| 格式 | 说明 |
-|------|------|
-| `.txt` | 纯文本文件 |
-| `.md` | Markdown 文档 |
-| `.pdf` | PDF 文档（自动提取文本） |
-| `.html/.htm` | 网页文件（自动清洗内容） |
+## 目录结构
 
----
-
-## 技术架构
-
-### 系统架构图
-
+```text
+assistant-bot/
+├── backend/
+│   ├── app/
+│   │   ├── api/                  # chat / upload / health 路由
+│   │   ├── core/                 # 配置与环境变量
+│   │   ├── models/               # Pydantic schema
+│   │   └── services/             # llm/rag/embedding/session/vision 核心服务
+│   ├── data/                     # 会话与向量数据
+│   ├── models/                   # GGUF 模型目录
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── components/           # ChatBox/SessionList/DocumentManager 等
+│   │   ├── hooks/                # useSessions/use-toast
+│   │   ├── types/                # TS 类型
+│   │   ├── App.tsx
+│   │   └── main.tsx
+│   └── package.json
+├── AGENTS.md                     # 代码代理协作规则（必读）
+├── ToD0.md                       # 项目进度与待办
+└── README.md
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         Frontend                            │
-│                    (React + Vite + Tailwind)                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │  ChatBox     │  │   Document   │  │   SessionList   │  │
-│  │  (对话组件)   │  │   Manager    │  │   (会话管理)     │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ SSE / REST API
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Backend (FastAPI)                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │  /api/chat   │  │  /api/upload │  │  /api/health     │  │
-│  │  (对话接口)   │  │  (文档上传)   │  │  (健康检查)      │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Llama.cpp    │    │ ChromaDB      │    │ GTE-large     │
-│  (Qwen2.5-7B) │    │ (向量数据库)   │    │ (Embedding)   │
-│  Metal GPU    │    │               │    │ MPS 加速      │
-└───────────────┘    └───────────────┘    └───────────────┘
-```
 
-### 技术栈
+## 开发规范
 
-#### 后端
-| 组件 | 选型 | 说明 |
-|------|------|------|
-| Web 框架 | **FastAPI** | 高性能异步框架，支持 SSE |
-| LLM 推理 | **Llama.cpp** | Python 绑定，Metal GPU 加速 |
-| 模型 | **Qwen2.5-7B-Instruct** | GGUF Q3_K_M 量化格式 |
-| 向量数据库 | **ChromaDB** | 本地持久化存储 |
-| Embedding | **thenlper/gte-large** | MPS 设备加速 |
+### 通用规范
+- 后端采用分层：`api -> services -> models/core`，避免在路由层堆业务逻辑。
+- 新接口优先补充 Pydantic schema，保持请求/响应稳定。
+- 前端使用 TypeScript，组件命名用 `PascalCase`，hooks 用 `useXxx`。
+- API 路径统一放在前端 `lib/api`（建议），避免散落硬编码 URL。
 
-#### 前端
-| 组件 | 选型 | 说明 |
-|------|------|------|
-| 框架 | **React 19** | 最新版本 |
-| 构建工具 | **Vite** | 极速开发体验 |
-| 样式 | **Tailwind CSS** | 原子化 CSS |
-| 组件库 | **Shadcn/UI** | 高质量 UI 组件 |
-| Markdown | **react-markdown** | Markdown 渲染 |
+### 命名与风格
+- Python：`snake_case`（函数/变量/文件），类名 `PascalCase`。
+- TypeScript：组件与类型 `PascalCase`，函数变量 `camelCase`。
+- 路由前缀固定 `/api`，按领域划分子路由（`/chat`、`/documents`、`/health`）。
 
----
+### 提交与协作建议
+- 每次开发优先更新 `ToD0.md` 中对应状态。
+- 大改动前先记录目标与风险，减少回归。
+- 涉及配置变化时同步更新 README 的“运行方式”和“.env 说明”。
 
-## 快速开始
+## 如何运行
 
-### 环境要求
+### 0) 选择 LLM Provider（本地/服务器）
 
-- **操作系统**: macOS (Apple Silicon M1/M2/M3)
-- **Python**: 3.10 或更高版本
-- **Node.js**: 18.0 或更高版本
-- **内存**: 建议 16GB 及以上
-- **磁盘空间**: 至少 10GB 可用空间
-
-### 1. 克隆项目
+在 `backend/.env` 中设置：
 
 ```bash
-git clone <repository-url>
-cd assistant-bot
+# 本地默认
+LLM_PROVIDER=llama_cpp
+
+# 或者使用远程 vLLM
+LLM_PROVIDER=vllm
+VLLM_BASE_URL=http://<SERVER_IP>:8100/v1
+VLLM_API_KEY=EMPTY
+# 若 deploy/vllm 使用 served model name（推荐）
+VLLM_MODEL=gemma4-e4b-it
+# 需与服务器 DEPLOY_PROFILE 对齐: rag_text | vision | full | benchmark
+VLLM_DEPLOY_PROFILE=rag_text
+VLLM_TIMEOUT_SECONDS=60
+VLLM_PROBE_TIMEOUT_SECONDS=4
+VLLM_HEALTH_CACHE_SECONDS=15
+
+# 多模态安全限制（仅 base64 载荷长度，不含 data:image 前缀）
+MAX_IMAGE_BASE64_CHARS=4000000
+# 仅在非 vLLM 视觉代理路径使用；建议 Gemma4 原生多模态时关闭 GLM 代理
+DISABLE_GLM_VISION=true
+# 对话文件附件限制（不入知识库）
+MAX_CHAT_FILE_BASE64_CHARS=8000000
+MAX_CHAT_FILE_CONTEXT_CHARS=12000
+CHAT_FILE_ALLOWED_EXTENSIONS=.txt,.md,.markdown,.pdf,.csv,.json,.log
+
+# 知识库文档上传限制（RAG 入库）
+MAX_UPLOAD_FILE_SIZE_MB=20
+MAX_BATCH_UPLOAD_FILES=10
+UPLOAD_ALLOWED_EXTENSIONS=.txt,.md,.markdown,.html,.htm,.pdf
+
+# 避免 tokenizers 在 fork/reload 场景刷告警
+TOKENIZERS_PARALLELISM=false
 ```
 
-### 2. 后端设置
+vLLM 服务器部署说明：`deploy/vllm/README.md`
+说明：当 `LLM_PROVIDER=vllm` 时，后端启动与 `/api/health/` 会校验远端连通性和模型可见性；健康探活使用短超时与缓存，避免隧道抖动时阻塞主请求。
+说明：当 `LLM_PROVIDER=vllm` 且请求中包含 `image` 字段时，后端会直接使用 Gemma4 原生多模态推理。若请求包含 `file` 字段，后端会解析文件文本并在本次对话中注入上下文（不写入向量库）。
+
+### 1) 后端
 
 ```bash
-# 进入后端目录
 cd backend
-
-# 创建虚拟环境
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# 安装依赖（Mac M3 Metal 优化版）
-CMAKE_ARGS="-DLLAMA_METAL=on" pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env
-# 编辑 .env 文件，配置模型路径等参数
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# Apple Silicon 推荐
+CMAKE_ARGS="-DLLAMA_METAL=on" pip install llama-cpp-python
+uvicorn app.main:app --reload
 ```
 
-### 3. 下载模型
+默认后端地址：`http://127.0.0.1:8000`
+
+### 2) 前端
 
 ```bash
-# 方法一：使用 Hugging Face Hub
-pip install huggingface_hub
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF qwen2.5-7b-instruct-q3_k_m.gguf --local-dir ./models
-
-# 方法二：手动下载
-# 从 https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF 下载
-# 将 qwen2.5-7b-instruct-q3_k_m.gguf 放入 backend/models/ 目录
-```
-
-### 4. 前端设置
-
-```bash
-# 新开一个终端，进入前端目录
 cd frontend
-
-# 安装依赖
 npm install
-
-# 启动开发服务器
 npm run dev
 ```
 
-### 5. 启动后端
+默认前端地址：`http://127.0.0.1:5173`
+
+前端思考/回答分段逻辑单测：
 
 ```bash
-# 在后端目录下启动服务
-cd backend
-source venv/bin/activate
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 6. 访问应用
-
-打开浏览器访问: **http://localhost:5173**
-
----
-
-## 项目结构
-
-```
-assistant-bot/
-├── backend/                    # 后端 FastAPI 服务
-│   ├── app/
-│   │   ├── api/               # API 路由
-│   │   │   ├── chat.py        # 对话接口 (SSE 流式)
-│   │   │   ├── upload.py      # 文档上传接口
-│   │   │   └── health.py      # 健康检查接口
-│   │   ├── core/
-│   │   │   └── config.py      # 配置管理
-│   │   ├── models/
-│   │   │   └── schema.py      # Pydantic 数据模型
-│   │   ├── services/
-│   │   │   ├── llm_service.py      # LLM 推理服务
-│   │   │   ├── embedding_service.py # Embedding 服务
-│   │   │   ├── rag_service.py      # RAG 检索服务
-│   │   │   └── session_service.py  # 会话管理服务
-│   │   └── main.py            # 应用入口
-│   ├── models/                # GGUF 模型文件存放目录
-│   ├── data/                  # 数据存储目录
-│   │   ├── chroma_db/         # ChromaDB 向量数据库
-│   │   └── sessions.json      # 会话记录
-│   ├── requirements.txt       # Python 依赖
-│   └── .env.example           # 环境变量示例
-│
-├── frontend/                  # 前端 React 应用
-│   ├── src/
-│   │   ├── components/        # React 组件
-│   │   │   ├── ChatBox.tsx       # 对话框组件
-│   │   │   ├── DocumentManager.tsx # 文档管理组件
-│   │   │   ├── SessionList.tsx    # 会话列表组件
-│   │   │   └── ui/                # UI 基础组件
-│   │   ├── hooks/             # 自定义 Hooks
-│   │   │   ├── useSessions.ts     # 会话管理
-│   │   │   └── use-toast.ts       # 提示通知
-│   │   ├── lib/
-│   │   │   ├── api.ts            # API 客户端
-│   │   │   └── utils.ts          # 工具函数
-│   │   ├── types/
-│   │   │   └── index.ts          # TypeScript 类型定义
-│   │   ├── App.tsx              # 应用主组件
-│   │   └── main.tsx             # 应用入口
-│   ├── package.json            # Node 依赖
-│   └── vite.config.ts          # Vite 配置
-│
-├── CLAUDE.md                  # Claude Code 开发指南
-├── README.md                  # 项目说明文档
-└── .gitignore                 # Git 忽略配置
-```
-
----
-
-## 开发指南
-
-### 后端开发
-
-#### 添加新的 API 端点
-
-```python
-# backend/app/api/new_endpoint.py
-from fastapi import APIRouter, Depends
-from app.models.schema import ChatRequest
-
-router = APIRouter()
-
-@router.post("/new-endpoint")
-async def new_endpoint(request: ChatRequest):
-    """新的 API 端点"""
-    return {"status": "success"}
-```
-
-#### 修改 RAG 检索参数
-
-编辑 `backend/app/core/config.py`:
-
-```python
-class Settings(BaseSettings):
-    # RAG 参数调整
-    CHUNK_SIZE: int = 800          # 文档切块大小
-    CHUNK_OVERLAP: int = 200       # 块重叠大小
-    RETRIEVAL_K: int = 4           # 检索块数量
-    MIN_RELEVANCE_SCORE: float = 0.20  # 最低相关度阈值
-```
-
-### 前端开发
-
-#### 添加新的 UI 组件
-
-```tsx
-// frontend/src/components/ui/NewComponent.tsx
-import { cn } from "@/lib/utils";
-
-interface NewComponentProps {
-  className?: string;
-}
-
-export function NewComponent({ className }: NewComponentProps) {
-  return (
-    <div className={cn("base-styles", className)}>
-      {/* 组件内容 */}
-    </div>
-  );
-}
-```
-
-#### API 调用示例
-
-```typescript
-// frontend/src/lib/api.ts
-export async function callApi(endpoint: string, data: any) {
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  return response.json();
-}
-```
-
-### 常用命令
-
-```bash
-# 后端
-cd backend
-source venv/bin/activate
-uvicorn app.main:app --reload          # 启动开发服务器
-python test_api.py                     # 测试 API
-python test_rag_accuracy.py            # 测试 RAG 准确率
-
-# 前端
 cd frontend
-npm run dev                            # 启动开发服务器
-npm run build                          # 构建生产版本
-npm run lint                           # 代码检查
-
-# 清理向量数据库
-rm -rf backend/data/chroma_db
+npm run test
 ```
 
----
+### 3) 运行前检查
+- 将 GGUF 模型放到 `backend/models/`。
+- 按需配置 `backend/.env`（模型路径、GLM API Key、CORS 等）。
+- 首次启动会初始化 `backend/data/chroma_db` 与会话数据文件。
 
-## 配置说明
+## 当前已知注意事项
 
-### 环境变量 (.env)
+- 前端 `npm run build` 目前会被历史遗留的 TS unused 报错阻断（`SessionList.tsx`、`ui/Dialog.tsx`），与本次 Gemma4/附件功能改造无直接关系。
+- `AGENTS.md` 中原“推荐模型”与当前配置不完全一致（文档提到 Mistral，配置默认 Qwen2.5），已在协作规则中改为“以代码配置为准”。
+- vLLM 服务器部署说明见 `deploy/vllm/README.md`。
+
+## 对话附件上传（直接给 AI 读）
+
+使用方式：
+- 在聊天输入框左侧点击回形针按钮上传文件（`txt/md/pdf/csv/json/log`）。
+- 可只发文件不输入文本，后端会自动补全默认提问。
+- 文件内容仅用于当前请求上下文，不会自动写入 RAG 知识库。
+
+适用场景：
+- 快速让模型总结一份临时文档
+- 对单个 PDF/文本做即时问答，不污染长期知识库
+
+## 项目内性能展示（Gemma4 E4）
+
+访问方式：
+- 启动前后端后，在左侧导航进入 `性能` Tab
+- 页面会调用 `GET /api/performance/overview`，聚合展示：
+  - 最新 `gemma4_direct_*` benchmark 指标（成功率、P95、吞吐、TTFT）
+  - 最新 `strict_suite_*` 总体状态（PASS/FAIL）
+  - 最新 `cap_probe_*` 能力检查通过情况
+
+前提：
+- 需先运行至少一轮测试脚本，结果写入 `vllm_test/results/`
+- 推荐顺序：`benchmark_gemma4_vllm.py` -> `strict_suite_gemma4_vllm.py` -> `probe_gemma4_capabilities.py`
+
+## 模式切换（Thinking / Tool Calling）
+
+你现在可以在聊天框中自主切换：
+- `Thinking`：对应请求参数 `enable_thinking=true`
+- `Tool Calling`：对应请求参数 `enable_tool_calling=true`
+
+说明：
+- 该切换是“请求级别”开关，用户可按会话即时选择。
+- 需要服务端 vLLM 启动时允许相关能力（例如 `ENABLE_REASONING=1`、`ENABLE_TOOL_CALLING=1`）。
+- 当前 Tool Calling 内置了两个演示工具：时间查询与数学计算。
+- 当 `LLM_PROVIDER=vllm` 且传图时，后端走 Gemma4 原生多模态；可通过 `DISABLE_GLM_VISION=true` 禁用 GLM 视觉代理，避免链路混淆。
+- 项目会通过 `GET /api/chat/mode-config` 感知当前 `VLLM_DEPLOY_PROFILE`，自动禁用不支持的开关：
+  - `rag_text`: 文本优先（不支持图像、Tool Calling）
+  - `vision`: 图文优先（支持图像，不支持 Tool Calling）
+  - `full`: 全能力（支持图像、Thinking、Tool Calling）
+  - `benchmark`: 压测模式（禁用图像/Thinking/Tool Calling）
+- 聊天框上方提供 `rag_text / vision / full / benchmark` 一键切换按钮（调用 `PUT /api/chat/mode-config`），切换后新请求自动按所选模式执行。
+- `Profile: xxx` 标签可点击查看四档能力说明（Image/Thinking/Tool Calling）。
+- `backend/.env` 中的 `VLLM_DEPLOY_PROFILE` 仅作为启动默认值；运行中可在前端直接切换模式。
+
+## vLLM 压测（本地后端 -> 远程 vLLM）
+
+项目内置一键压测脚本：
 
 ```bash
-# API 设置
-API_V1_PREFIX=/api
-PROJECT_NAME=AssistantBot
-VERSION=0.1.0
-
-# CORS 配置
-CORS_ORIGINS=["http://localhost:5173","http://localhost:3000"]
-
-# LLM 模型配置
-MODEL_PATH=./models/qwen2.5-7b-instruct-q3_k_m.gguf
-N_GPU_LAYERS=-1          # -1 表示全部卸载到 GPU
-N_CTX=4096               # 上下文窗口大小
-TEMPERATURE=0.7          # 生成温度
-MAX_TOKENS=2048          # 最大生成 token 数
-
-# Embedding 配置
-EMBEDDING_MODEL=thenlper/gte-large
-EMBEDDING_DEVICE=mps     # Apple Silicon Neural Engine
-
-# RAG 配置
-CHUNK_SIZE=800
-CHUNK_OVERLAP=200
-RETRIEVAL_K=4
-MIN_RELEVANCE_SCORE=0.20
-
-# 数据存储
-CHROMA_PERSIST_DIR=./data/chroma_db
-COLLECTION_NAME=documents
+bash vllm_test/run_benchmark.sh
 ```
 
----
+默认执行 5 路并发压测并输出统计汇总。详细参数说明见 `vllm_test/README.md`。
 
-## API 文档
+自动扫描并发上限（1~10 并发）：
 
-启动后端服务后，访问以下地址查看完整 API 文档：
+```bash
+bash vllm_test/sweep_concurrency.sh
+```
 
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+## Gemma4 直连 vLLM 压测（推荐）
 
-### 核心 API 端点
+用于评估 vLLM 模型服务本身性能（绕过本地后端），可直接测 Gemma4 的延迟与吞吐：
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/api/chat/stream` | POST | SSE 流式对话 |
-| `/api/documents/upload` | POST | 上传文档 |
-| `/api/documents/ingest-url` | POST | 导入网页内容 |
-| `/api/documents` | GET | 获取文档列表 |
-| `/api/documents/{id}` | DELETE | 删除文档 |
-| `/api/sessions` | GET | 获取会话列表 |
-| `/api/health` | GET | 健康检查 |
+```bash
+python3 vllm_test/benchmark_gemma4_vllm.py \
+  --base-url http://127.0.0.1:8100/v1 \
+  --api-key EMPTY \
+  --model gemma4-e4b-it \
+  --requests 80 \
+  --concurrency 8 \
+  --max-tokens 256
+```
 
----
+流式压测（统计 TTFT）：
 
-## 常见问题
+```bash
+python3 vllm_test/benchmark_gemma4_vllm.py \
+  --base-url http://127.0.0.1:8100/v1 \
+  --model gemma4-e4b-it \
+  --requests 40 \
+  --concurrency 8 \
+  --stream
+```
 
-### Q: 模型加载很慢怎么办？
-A: 首次加载模型需要 1-2 分钟，后续会缓存到内存。可以尝试使用更小的量化模型（如 Q4_K_M）来加快加载速度。
+详细参数见：`vllm_test/README.md`。
 
-### Q: Metal GPU 加速不生效？
-A: 确保安装时使用了 `CMAKE_ARGS="-DLLAMA_METAL=on"` 参数，并检查 `n_gpu_layers=-1` 配置。
+## Gemma4 严格压测（多阶段门禁）
 
-### Q: 网页抓取失败？
-A: 某些网站可能有反爬虫机制，建议直接复制内容到文本文件后上传。
+如果你需要更严格的发布前验证，可执行多阶段严格套件（流式TTFT、高并发、长输出、soak）：
 
-### Q: 向量检索结果不相关？
-A: 可以尝试调整 `CHUNK_SIZE`、`RETRIEVAL_K` 和 `MIN_RELEVANCE_SCORE` 参数。
+```bash
+python3 vllm_test/strict_suite_gemma4_vllm.py \
+  --base-url http://127.0.0.1:8100/v1 \
+  --api-key EMPTY \
+  --model gemma4-e4b-it \
+  --strict-model
+```
 
----
+结果会输出 `PASS/FAIL`，并生成 `suite_summary.txt` 与 `suite_report.json`。详细见 `vllm_test/README.md`。
 
-## 开发路线图
+## Gemma4 部署能力验收（推荐）
 
-- [x] Phase 1: FastAPI + Llama.cpp 基础对话
-- [x] Phase 2: ChromaDB 向量检索
-- [x] Phase 3: React 前端界面
-- [x] Phase 4: 文档上传与管理
-- [ ] Phase 5: 多模态支持（图片）
-- [ ] Phase 6: 语音交互
-- [ ] Phase 7: Agent 联网搜索
+执行能力探测脚本（模型可见性、文本、多模态、结构化、thinking、tool calling）：
 
----
+```bash
+python3 vllm_test/probe_gemma4_capabilities.py \
+  --base-url http://127.0.0.1:8100/v1 \
+  --api-key EMPTY \
+  --model gemma4-e4b-it \
+  --require-full
+```
 
-## 许可证
-
-MIT License
-
----
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
----
-
-<div align="center">
-
-**Built with ❤️ for Mac M3**
-
-</div>
+输出目录：`vllm_test/results/cap_probe_<timestamp>/capability_report.json`

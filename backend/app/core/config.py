@@ -3,11 +3,18 @@
 Mac M3 optimized settings for Metal acceleration.
 """
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        # Always resolve env from backend/.env regardless of launch cwd.
+        env_file=str(Path(__file__).resolve().parent.parent.parent / ".env"),
+        case_sensitive=True,
+    )
 
     # API Settings
     API_V1_PREFIX: str = "/api"
@@ -18,17 +25,38 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     # LLM Settings (Qwen2.5-7B GGUF - much smarter model)
+    LLM_PROVIDER: str = "llama_cpp"  # llama_cpp | vllm
     MODEL_PATH: str = "./models/qwen2.5-7b-instruct-q3_k_m.gguf"
     N_GPU_LAYERS: int = -1  # -1 = offload all layers to Metal GPU
     N_CTX: int = 4096  # Context window size
     F16_KV: bool = True  # Use half-precision for KV cache
     TEMPERATURE: float = 0.7
-    MAX_TOKENS: int = 2048
+    MAX_TOKENS: int = 512
     TOP_P: float = 0.95
     TOP_K: int = 40
 
     # Chat template type (qwen, mistral, llama, etc.)
     CHAT_TEMPLATE_TYPE: str = "qwen"
+
+    # vLLM Server Settings (OpenAI-compatible endpoint)
+    VLLM_BASE_URL: str = "http://127.0.0.1:8100/v1"
+    VLLM_API_KEY: str = "EMPTY"
+    VLLM_MODEL: str = "gemma4-e4b-it"
+    VLLM_DEPLOY_PROFILE: str = "rag_text"  # rag_text | vision | full | benchmark
+    VLLM_TIMEOUT_SECONDS: float = 60.0
+    VLLM_PROBE_TIMEOUT_SECONDS: float = 4.0
+    VLLM_HEALTH_CACHE_SECONDS: float = 15.0
+
+    # Multimodal safety guard (base64 chars, without data URL prefix)
+    MAX_IMAGE_BASE64_CHARS: int = 4_000_000
+    MAX_CHAT_FILE_BASE64_CHARS: int = 8_000_000
+    MAX_CHAT_FILE_CONTEXT_CHARS: int = 12_000
+    CHAT_FILE_ALLOWED_EXTENSIONS: str = ".txt,.md,.markdown,.pdf,.csv,.json,.log"
+
+    # Document upload limits
+    MAX_UPLOAD_FILE_SIZE_MB: int = 20
+    MAX_BATCH_UPLOAD_FILES: int = 10
+    UPLOAD_ALLOWED_EXTENSIONS: str = ".txt,.md,.markdown,.html,.htm,.pdf"
 
     # Embedding Settings (GTE-large with MPS)
     EMBEDDING_MODEL: str = "thenlper/gte-large"
@@ -37,6 +65,7 @@ class Settings(BaseSettings):
     # Vision Model Settings
     # Choice: "glm" for GLM-4V API (recommended, no local model), "local" for BLIP-2
     VISION_BACKEND: str = "glm"  # "glm" or "local"
+    DISABLE_GLM_VISION: bool = False  # Force disable GLM vision path (recommended when using Gemma4 native multimodal)
 
     # GLM-4V API Settings (智谱 AI)
     GLM_API_KEY: str = ""  # 智谱 AI API Key
@@ -85,9 +114,32 @@ class Settings(BaseSettings):
 
 {question} [/INST]"""
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    @model_validator(mode="after")
+    def validate_provider_settings(self) -> "Settings":
+        """Fail fast on invalid provider configuration."""
+        if self.LLM_PROVIDER not in {"llama_cpp", "vllm"}:
+            raise ValueError("LLM_PROVIDER must be 'llama_cpp' or 'vllm'")
+
+        if self.LLM_PROVIDER == "vllm":
+            if not self.VLLM_API_KEY.strip():
+                raise ValueError("VLLM_API_KEY is required when LLM_PROVIDER=vllm")
+            if not self.VLLM_BASE_URL.startswith(("http://", "https://")):
+                raise ValueError("VLLM_BASE_URL must start with http:// or https://")
+            if self.VLLM_DEPLOY_PROFILE not in {"rag_text", "vision", "full", "benchmark"}:
+                raise ValueError("VLLM_DEPLOY_PROFILE must be one of: rag_text, vision, full, benchmark")
+
+        if self.MAX_UPLOAD_FILE_SIZE_MB <= 0:
+            raise ValueError("MAX_UPLOAD_FILE_SIZE_MB must be > 0")
+        if self.MAX_BATCH_UPLOAD_FILES <= 0:
+            raise ValueError("MAX_BATCH_UPLOAD_FILES must be > 0")
+        if self.MAX_CHAT_FILE_BASE64_CHARS <= 0:
+            raise ValueError("MAX_CHAT_FILE_BASE64_CHARS must be > 0")
+        if self.MAX_CHAT_FILE_CONTEXT_CHARS <= 0:
+            raise ValueError("MAX_CHAT_FILE_CONTEXT_CHARS must be > 0")
+        if self.VISION_BACKEND not in {"glm", "local"}:
+            raise ValueError("VISION_BACKEND must be 'glm' or 'local'")
+
+        return self
 
 
 # Global settings instance

@@ -7,6 +7,8 @@ from typing import List
 
 # 设置 HuggingFace 国内镜像加速下载
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+# Disable tokenizers parallelism to avoid fork-related warnings/deadlocks.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from sentence_transformers import SentenceTransformer
 from app.core.config import settings

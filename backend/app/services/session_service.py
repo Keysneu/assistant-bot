@@ -35,7 +35,15 @@ def _load_sessions():
                     ChatMessage(
                         role=msg["role"],
                         content=msg["content"],
-                        timestamp=datetime.fromisoformat(msg["timestamp"]) if msg.get("timestamp") else None
+                        timestamp=datetime.fromisoformat(msg["timestamp"]) if msg.get("timestamp") else None,
+                        has_image=msg.get("has_image", False),
+                        image_data=msg.get("image_data"),
+                        image_format=msg.get("image_format"),
+                        has_file=msg.get("has_file", False),
+                        file_name=msg.get("file_name"),
+                        file_format=msg.get("file_format"),
+                        reasoning_content=msg.get("reasoning_content"),
+                        final_content=msg.get("final_content"),
                     )
                     for msg in messages_data
                 ]
@@ -65,6 +73,11 @@ def _save_sessions():
                 "has_image": msg.has_image if hasattr(msg, "has_image") else False,
                 "image_data": msg.image_data if hasattr(msg, "image_data") else None,
                 "image_format": msg.image_format if hasattr(msg, "image_format") else None,
+                "has_file": msg.has_file if hasattr(msg, "has_file") else False,
+                "file_name": msg.file_name if hasattr(msg, "file_name") else None,
+                "file_format": msg.file_format if hasattr(msg, "file_format") else None,
+                "reasoning_content": msg.reasoning_content if hasattr(msg, "reasoning_content") else None,
+                "final_content": msg.final_content if hasattr(msg, "final_content") else None,
             }
             for msg in messages
         ]
@@ -107,7 +120,12 @@ def add_message(
     content: str,
     has_image: bool = False,
     image_data: str = None,
-    image_format: str = None
+    image_format: str = None,
+    has_file: bool = False,
+    file_name: str = None,
+    file_format: str = None,
+    reasoning_content: str = None,
+    final_content: str = None,
 ) -> ChatMessage:
     """Add a message to the conversation history.
 
@@ -118,6 +136,11 @@ def add_message(
         has_image: Whether the message has an attached image
         image_data: Base64 encoded image data
         image_format: Image format (png, jpeg, etc.)
+        has_file: Whether the message has an attached file
+        file_name: Uploaded file name
+        file_format: Uploaded file format/extension
+        reasoning_content: Structured reasoning content for assistant message
+        final_content: Structured final answer content for assistant message
 
     Returns:
         The created message
@@ -133,6 +156,11 @@ def add_message(
         has_image=has_image,
         image_data=image_data,
         image_format=image_format,
+        has_file=has_file,
+        file_name=file_name,
+        file_format=file_format,
+        reasoning_content=reasoning_content,
+        final_content=final_content,
     )
     _sessions[session_id].append(message)
 
@@ -229,6 +257,11 @@ def get_session_info(session_id: str) -> Optional[Dict]:
                 "has_image": msg.has_image if hasattr(msg, "has_image") else False,
                 "image_data": msg.image_data if hasattr(msg, "image_data") else None,
                 "image_format": msg.image_format if hasattr(msg, "image_format") else None,
+                "has_file": msg.has_file if hasattr(msg, "has_file") else False,
+                "file_name": msg.file_name if hasattr(msg, "file_name") else None,
+                "file_format": msg.file_format if hasattr(msg, "file_format") else None,
+                "reasoning_content": msg.reasoning_content if hasattr(msg, "reasoning_content") else None,
+                "final_content": msg.final_content if hasattr(msg, "final_content") else None,
             }
             for msg in _sessions[session_id]
         ]

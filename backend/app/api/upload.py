@@ -1,55 +1,79 @@
 """Document upload and URL ingestion API endpoints."""
-from fastapi import APIRouter, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+import tempfile
+from pathlib import Path
+
+from fastapi import APIRouter, UploadFile, HTTPException, File
 
 from app.models.schema import (
     DocumentUploadResponse,
+    DocumentBatchUploadResponse,
     URLRequest,
     URLIngestResponse,
     DocumentListResponse,
     DocumentDeleteResponse,
 )
+from app.core.config import settings
 from app.services.rag_service import ingest_file, ingest_url, list_documents, delete_document
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-@router.post("/upload", response_model=DocumentUploadResponse)
-async def upload_document(file: UploadFile):
-    """Upload and process a document file.
+def _allowed_extensions() -> set[str]:
+    """Parse allowed file extensions from settings."""
+    extensions: set[str] = set()
+    for item in settings.UPLOAD_ALLOWED_EXTENSIONS.split(","):
+        value = item.strip().lower()
+        if not value:
+            continue
+        if not value.startswith("."):
+            value = f".{value}"
+        extensions.add(value)
+    return extensions
 
-    Supports: .txt, .md, .html, .htm files
 
-    Args:
-        file: Uploaded file
+def _resolve_extension(filename: str) -> str:
+    """Resolve extension from file name."""
+    return Path(filename).suffix.lower()
 
-    Returns:
-        Document upload response with processing status
-    """
-    # Validate file type
-    allowed_extensions = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf"}
-    file_ext = "." + file.filename.split(".")[-1].lower() if "." in file.filename else ""
 
+async def _process_upload(file: UploadFile) -> DocumentUploadResponse:
+    """Validate, store temporarily, and ingest an uploaded file."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
+    allowed_extensions = _allowed_extensions()
+    file_ext = _resolve_extension(file.filename)
     if file_ext not in allowed_extensions:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}",
+            detail=f"Unsupported file type. Allowed: {', '.join(sorted(allowed_extensions))}",
         )
 
-    # Save file temporarily
-    from pathlib import Path
-    import tempfile
+    max_bytes = settings.MAX_UPLOAD_FILE_SIZE_MB * 1024 * 1024
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail=f"文件内容为空: {file.filename}")
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"文件过大: {file.filename} ({len(content) / 1024 / 1024:.2f}MB), "
+                f"限制 {settings.MAX_UPLOAD_FILE_SIZE_MB}MB"
+            ),
+        )
 
-    temp_dir = Path(tempfile.gettempdir())
-    temp_path = temp_dir / f"upload_{file.filename}"
+    temp_path: Path | None = None
 
     try:
-        # Write uploaded file
-        with open(temp_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="upload_",
+            suffix=file_ext,
+            delete=False,
+        ) as tmp_file:
+            tmp_file.write(content)
+            temp_path = Path(tmp_file.name)
 
-        # Ingest file
         doc_id, chunk_count = await ingest_file(str(temp_path))
 
         return DocumentUploadResponse(
@@ -59,13 +83,73 @@ async def upload_document(file: UploadFile):
             chunk_count=chunk_count,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}") from e
 
     finally:
-        # Clean up temp file
-        if temp_path.exists():
+        if temp_path and temp_path.exists():
             temp_path.unlink()
+        await file.close()
+
+
+@router.post("/upload", response_model=DocumentUploadResponse)
+async def upload_document(file: UploadFile = File(...)):
+    """Upload and process a single document."""
+    return await _process_upload(file)
+
+
+@router.post("/upload-batch", response_model=DocumentBatchUploadResponse)
+async def upload_documents_batch(files: list[UploadFile] = File(...)):
+    """Upload and process multiple documents in one request."""
+    if not files:
+        raise HTTPException(status_code=400, detail="至少上传一个文件")
+    if len(files) > settings.MAX_BATCH_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"单次最多上传 {settings.MAX_BATCH_UPLOAD_FILES} 个文件，"
+                f"当前为 {len(files)} 个"
+            ),
+        )
+
+    results: list[DocumentUploadResponse] = []
+    total_chunks = 0
+    success_count = 0
+
+    for file in files:
+        try:
+            result = await _process_upload(file)
+            success_count += 1
+            total_chunks += result.chunk_count
+            results.append(result)
+        except HTTPException as exc:
+            results.append(
+                DocumentUploadResponse(
+                    document_id="",
+                    filename=file.filename or "unknown",
+                    status=f"failed: {exc.detail}",
+                    chunk_count=0,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                DocumentUploadResponse(
+                    document_id="",
+                    filename=file.filename or "unknown",
+                    status=f"failed: {str(exc)}",
+                    chunk_count=0,
+                )
+            )
+
+    return DocumentBatchUploadResponse(
+        documents=results,
+        total_files=len(files),
+        success_count=success_count,
+        failed_count=len(files) - success_count,
+        total_chunks=total_chunks,
+    )
 
 
 @router.post("/ingest-url", response_model=URLIngestResponse)

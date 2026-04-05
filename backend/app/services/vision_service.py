@@ -30,6 +30,13 @@ _glm_client: Optional[httpx.AsyncClient] = None
 _glm_available: bool = False
 
 
+def _glm_path_enabled() -> bool:
+    """Whether GLM vision path is enabled by runtime configuration."""
+    if settings.DISABLE_GLM_VISION:
+        return False
+    return settings.VISION_BACKEND == "glm"
+
+
 def _init_glm_client() -> bool:
     """Initialize GLM API client.
 
@@ -37,6 +44,10 @@ def _init_glm_client() -> bool:
         True if GLM API is configured and available
     """
     global _glm_available
+
+    if not _glm_path_enabled():
+        logger.info("GLM vision path disabled by config (DISABLE_GLM_VISION=true or VISION_BACKEND!=glm)")
+        return False
 
     if not settings.GLM_API_KEY:
         logger.warning("GLM_API_KEY not set, vision features will use local model or be disabled")
@@ -233,7 +244,7 @@ async def analyze_image_content(
     """
     global _glm_available
 
-    # Initialize GLM client on first use
+    # Initialize GLM client on first use.
     if _glm_available is False and _init_glm_client():
         _glm_available = True
 
@@ -257,7 +268,7 @@ async def analyze_image_content(
 
         else:
             raise RuntimeError(
-                "Vision analysis unavailable: GLM API not configured (set GLM_API_KEY in .env) "
+                "Vision analysis unavailable: GLM path disabled/not configured "
                 "and local model disabled. Image analysis will be skipped."
             )
 
@@ -268,6 +279,9 @@ async def analyze_image_content(
 
 def is_vision_available() -> bool:
     """Check if any vision backend is available."""
+    if settings.DISABLE_GLM_VISION:
+        return settings.VISION_BACKEND == "local"
+
     if _glm_available:
         return True
 
@@ -276,7 +290,7 @@ def is_vision_available() -> bool:
         return True
 
     # Check if GLM API key is configured
-    if settings.GLM_API_KEY:
+    if settings.VISION_BACKEND == "glm" and settings.GLM_API_KEY:
         return True
 
     return False

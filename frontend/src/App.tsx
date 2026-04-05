@@ -1,4 +1,4 @@
-import { useState, useEffect, Suspense, lazy } from "react";
+import { useState, useEffect, useRef, Suspense, lazy } from "react";
 // import { ChatBox } from "./components/ChatBox";
 // import { DocumentManager } from "./components/DocumentManager";
 import { SessionList } from "./components/SessionList";
@@ -13,11 +13,13 @@ import {
   ChevronRight,
   Loader2,
   MessageSquare,
+  Gauge,
 } from "lucide-react";
 import { Logo } from "./components/Logo";
 
 const ChatBox = lazy(() => import("./components/ChatBox").then(module => ({ default: module.ChatBox })));
 const DocumentManager = lazy(() => import("./components/DocumentManager").then(module => ({ default: module.DocumentManager })));
+const PerformancePanel = lazy(() => import("./components/PerformancePanel").then(module => ({ default: module.PerformancePanel })));
 
 import { useSessions } from "./hooks/useSessions";
 import { cn } from "./lib/utils";
@@ -26,9 +28,10 @@ import { Toaster } from "./components/ui/Toaster";
 
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [activeTab, setActiveTab] = useState<"chat" | "documents">("chat");
+  const [activeTab, setActiveTab] = useState<"chat" | "documents" | "performance">("chat");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
+  const healthCheckingRef = useRef(false);
 
   const {
     sessions,
@@ -45,6 +48,8 @@ function App() {
 
   useEffect(() => {
     const checkHealth = async () => {
+      if (healthCheckingRef.current) return;
+      healthCheckingRef.current = true;
       try {
         const status = await healthCheck();
         setHealth(status);
@@ -56,11 +61,13 @@ function App() {
           embedding_loaded: false,
           vector_db_ready: false,
         });
+      } finally {
+        healthCheckingRef.current = false;
       }
     };
 
     checkHealth();
-    const interval = setInterval(checkHealth, 5000);
+    const interval = setInterval(checkHealth, 15000);
     return () => clearInterval(interval);
   }, []);
 
@@ -141,7 +148,7 @@ function App() {
             <button
               onClick={() => setActiveTab("chat")}
               className={cn(
-                "flex-1 flex items-center justify-center gap-2 py-1.5 text-sm font-medium rounded-md transition-all duration-200",
+                "flex-1 flex items-center justify-center gap-2 py-1.5 text-xs font-medium rounded-md transition-all duration-200",
                 activeTab === "chat" 
                   ? "bg-background text-foreground shadow-sm" 
                   : "text-muted-foreground hover:text-foreground"
@@ -153,7 +160,7 @@ function App() {
             <button
               onClick={() => setActiveTab("documents")}
               className={cn(
-                "flex-1 flex items-center justify-center gap-2 py-1.5 text-sm font-medium rounded-md transition-all duration-200",
+                "flex-1 flex items-center justify-center gap-2 py-1.5 text-xs font-medium rounded-md transition-all duration-200",
                 activeTab === "documents" 
                   ? "bg-background text-foreground shadow-sm" 
                   : "text-muted-foreground hover:text-foreground"
@@ -161,6 +168,18 @@ function App() {
             >
               <FileText className="w-4 h-4" />
               知识库
+            </button>
+            <button
+              onClick={() => setActiveTab("performance")}
+              className={cn(
+                "flex-1 flex items-center justify-center gap-2 py-1.5 text-xs font-medium rounded-md transition-all duration-200",
+                activeTab === "performance"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <Gauge className="w-4 h-4" />
+              性能
             </button>
           </div>
         </div>
@@ -181,6 +200,12 @@ function App() {
             <div className="p-4 text-sm text-muted-foreground text-center mt-10">
               <FileText className="w-10 h-10 mx-auto mb-2 opacity-50" />
               <p>请在主界面管理文档</p>
+            </div>
+          )}
+          {activeTab === "performance" && (
+            <div className="p-4 text-sm text-muted-foreground text-center mt-10">
+              <Gauge className="w-10 h-10 mx-auto mb-2 opacity-50" />
+              <p>请在主界面查看 Gemma4 性能数据</p>
             </div>
           )}
         </div>
@@ -225,8 +250,10 @@ function App() {
                     </>
                   )}
                 </>
-              ) : (
+              ) : activeTab === "documents" ? (
                 <span className="text-foreground">知识库管理</span>
+              ) : (
+                <span className="text-foreground">Gemma4 性能展示</span>
               )}
             </div>
           </div>
@@ -250,8 +277,10 @@ function App() {
                 onSessionChange={switchSession}
                 onRefreshSessions={loadSessions}
               />
-            ) : (
+            ) : activeTab === "documents" ? (
               <DocumentManager />
+            ) : (
+              <PerformancePanel />
             )}
           </Suspense>
         </div>
