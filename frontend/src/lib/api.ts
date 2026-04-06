@@ -6,6 +6,9 @@ import type {
   DocumentBatchUploadResponse,
   PerformanceOverviewResponse,
   ChatModeConfigResponse,
+  ChatImageUploadResponse,
+  ChatAudioUploadResponse,
+  ChatVideoUploadResponse,
 } from "../types";
 
 // Session types
@@ -34,9 +37,19 @@ export interface ChatMessage {
   has_image?: boolean;
   image_data?: string;
   image_format?: string;
+  image_id?: string;
+  image_ids?: string[];
+  image_url?: string;
+  image_urls?: string[];
   has_file?: boolean;
   file_name?: string;
   file_format?: string;
+  has_audio?: boolean;
+  audio_url?: string;
+  audio_urls?: string[];
+  has_video?: boolean;
+  video_url?: string;
+  video_urls?: string[];
   reasoning_content?: string;
   final_content?: string;
 }
@@ -47,21 +60,53 @@ export interface MultimodalChatRequest {
   session_id?: string;
   use_search?: boolean;
   stream?: boolean;
+  image_id?: string;
+  image_ids?: string[];
   image?: string;  // Base64 encoded image
+  images?: string[]; // Multiple base64 encoded images
   image_format?: string;  // Image format (png, jpeg, webp, gif)
+  image_formats?: string[]; // Image formats aligned with `images`
   file?: string;  // Base64 encoded file
   file_name?: string;
   file_format?: string;
+  audio_url?: string;
+  audio_urls?: string[];
+  video_url?: string;
+  video_urls?: string[];
   enable_thinking?: boolean;
   enable_tool_calling?: boolean;
-  deploy_profile?: string;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+function resolveDefaultApiBaseUrl(): string {
+  const configured = String(import.meta.env.VITE_API_URL || "").trim();
+  if (configured) {
+    return configured.replace(/\/+$/, "");
+  }
+
+  if (typeof window !== "undefined" && window.location?.hostname) {
+    const host = String(window.location.hostname || "").toLowerCase();
+    // Prefer IPv4 loopback for local dev to avoid localhost IPv6 (::1) conflicts.
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") {
+      return "http://127.0.0.1:8000";
+    }
+    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+    return `${protocol}//${window.location.hostname}:8000`;
+  }
+
+  return "http://127.0.0.1:8000";
+}
+
+export const API_BASE_URL = resolveDefaultApiBaseUrl();
 
 export const API = {
   chat: `${API_BASE_URL}/api/chat/`,
   stream: `${API_BASE_URL}/api/chat/stream`,
+  chatImageUpload: `${API_BASE_URL}/api/chat/images/upload`,
+  chatImage: (id: string) => `${API_BASE_URL}/api/chat/images/${id}`,
+  chatAudioUpload: `${API_BASE_URL}/api/chat/audios/upload`,
+  chatAudio: (id: string) => `${API_BASE_URL}/api/chat/audios/${id}`,
+  chatVideoUpload: `${API_BASE_URL}/api/chat/videos/upload`,
+  chatVideo: (id: string) => `${API_BASE_URL}/api/chat/videos/${id}`,
   chatModeConfig: `${API_BASE_URL}/api/chat/mode-config`,
   sessions: `${API_BASE_URL}/api/chat/sessions`,
   session: (id: string) => `${API_BASE_URL}/api/chat/sessions/${id}`,
@@ -79,6 +124,18 @@ export const API = {
   health: `${API_BASE_URL}/api/health/`,
   performanceOverview: `${API_BASE_URL}/api/performance/overview`,
 };
+
+export function resolveApiUrl(rawUrl: string | undefined | null): string | undefined {
+  const value = String(rawUrl || "").trim();
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return new URL(value, API_BASE_URL).toString();
+  } catch {
+    return undefined;
+  }
+}
 
 export async function healthCheck(): Promise<HealthResponse> {
   const response = await fetch(API.health);
@@ -101,18 +158,6 @@ export async function getChatModeConfig(): Promise<ChatModeConfigResponse> {
   return response.json();
 }
 
-export async function updateChatModeConfig(deployProfile: string): Promise<ChatModeConfigResponse> {
-  const response = await fetch(API.chatModeConfig, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ deploy_profile: deployProfile }),
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to update chat mode config: ${response.status} ${await response.text()}`);
-  }
-  return response.json();
-}
-
 export async function sendMessage(message: string, sessionId?: string) {
   const response = await fetch(API.chat, {
     method: "POST",
@@ -129,19 +174,30 @@ export async function sendMessage(message: string, sessionId?: string) {
 export async function* streamMessage(
   message: string,
   sessionId?: string,
-  imageData?: string,
+  imageId?: string,
   imageFormat?: string,
   fileData?: string,
   fileName?: string,
   fileFormat?: string,
   enableThinking?: boolean,
   enableToolCalling?: boolean,
-  deployProfile?: string,
   onMetadata?: (metadata: {
     session_id?: string;
     sources?: Array<Record<string, unknown>>;
     has_context?: boolean;
     has_image?: boolean;
+    has_audio?: boolean;
+    has_video?: boolean;
+    image_id?: string;
+    image_ids?: string[];
+    image_count?: number;
+    audio_url?: string;
+    audio_urls?: string[];
+    audio_count?: number;
+    audio_prefetched_count?: number;
+    video_url?: string;
+    video_urls?: string[];
+    video_count?: number;
     has_file?: boolean;
     multimodal_mode?: string;
     deploy_profile?: string;
@@ -160,39 +216,86 @@ export async function* streamMessage(
     reasoning_content?: string | null;
     final_content?: string | null;
   }) => void,
+  imageIds?: string[],
+  audioUrl?: string,
+  audioUrls?: string[],
+  videoUrl?: string,
+  videoUrls?: string[],
 ): AsyncGenerator<string, void, unknown> {
-  const hasImage = Boolean(imageData && imageData.trim());
+  const normalizedImageIds = (imageIds || []).map((item) => item.trim()).filter(Boolean);
+  const normalizedAudioUrls = [audioUrl || "", ...(audioUrls || [])]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const normalizedVideoUrls = [videoUrl || "", ...(videoUrls || [])]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const hasImage = Boolean((imageId && imageId.trim()) || normalizedImageIds.length > 0);
+  const hasAudio = normalizedAudioUrls.length > 0;
+  const hasVideo = normalizedVideoUrls.length > 0;
   const hasFile = Boolean(fileData && fileData.trim());
   const trimmedMessage = message.trim();
   // Keep image-only requests valid for backend schema and model prompt.
-  const effectiveMessage = trimmedMessage || (hasImage ? "请描述这张图片" : (hasFile ? "请阅读并总结这个文件的重点" : " "));
+  // Audio/Video/File are sent as native multimodal blocks alongside the text - no extra emphasis needed.
+  const effectiveMessage = trimmedMessage || (
+    hasImage
+      ? "请描述这张图片"
+      : (
+        hasAudio
+          ? " "  // Audio is sent as native multimodal block; Gemma4 handles it directly
+          : (
+            hasVideo
+              ? "请总结视频里发生了什么，并提取关键事件和时间线。如果视频中有人提问，请直接回答。"
+              : (hasFile ? "请阅读并总结这个文件的重点" : " ")
+          )
+      )
+  );
 
   const requestBody: MultimodalChatRequest = {
     message: effectiveMessage,
     session_id: sessionId,
     enable_thinking: Boolean(enableThinking),
     enable_tool_calling: Boolean(enableToolCalling),
-    deploy_profile: deployProfile,
   };
 
-  // Add image data if provided
+  // Add cached image reference if provided
   if (hasImage) {
-    requestBody.image = imageData;
-    requestBody.image_format = imageFormat || "png";
+    if (normalizedImageIds.length > 0) {
+      requestBody.image_ids = normalizedImageIds;
+    } else {
+      requestBody.image_id = imageId;
+      requestBody.image_format = imageFormat || "jpeg";
+    }
   }
   if (hasFile) {
     requestBody.file = fileData;
     requestBody.file_name = fileName;
     requestBody.file_format = fileFormat;
   }
+  if (hasAudio) {
+    requestBody.audio_url = normalizedAudioUrls[0];
+    if (normalizedAudioUrls.length > 1) {
+      requestBody.audio_urls = normalizedAudioUrls;
+    }
+  }
+  if (hasVideo) {
+    requestBody.video_url = normalizedVideoUrls[0];
+    if (normalizedVideoUrls.length > 1) {
+      requestBody.video_urls = normalizedVideoUrls;
+    }
+  }
 
   console.debug("Sending chat stream request", {
     session_id: sessionId,
     has_image: hasImage,
+    has_audio: hasAudio,
+    has_video: hasVideo,
     has_file: hasFile,
     enable_thinking: Boolean(enableThinking),
     enable_tool_calling: Boolean(enableToolCalling),
-    image_chars: imageData?.length ?? 0,
+    image_id: imageId || "",
+    image_ids: normalizedImageIds,
+    audio_urls: normalizedAudioUrls,
+    video_urls: normalizedVideoUrls,
     file_chars: fileData?.length ?? 0,
     message_chars: effectiveMessage.length,
   });
@@ -258,6 +361,48 @@ export async function* streamMessage(
       }
     }
   }
+}
+
+export async function uploadChatImage(file: File): Promise<ChatImageUploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(API.chatImageUpload, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(`图片上传失败: ${response.status} ${await response.text()}`);
+  }
+  return response.json();
+}
+
+export async function uploadChatAudio(file: File): Promise<ChatAudioUploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(API.chatAudioUpload, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(`音频上传失败: ${response.status} ${await response.text()}`);
+  }
+  return response.json();
+}
+
+export async function uploadChatVideo(file: File): Promise<ChatVideoUploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(API.chatVideoUpload, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(`视频上传失败: ${response.status} ${await response.text()}`);
+  }
+  return response.json();
 }
 
 export async function uploadDocument(file: File): Promise<DocumentUploadResponse> {

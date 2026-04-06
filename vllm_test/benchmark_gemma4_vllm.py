@@ -91,6 +91,13 @@ def parse_completion_content(content: Any) -> int:
     return 0
 
 
+def build_prompt_for_request(base_prompt: str, request_id: int, unique_prompt_per_request: bool) -> str:
+    if not unique_prompt_per_request:
+        return base_prompt
+    # Put request_id at the beginning to avoid prefix-cache hit on the first token blocks.
+    return f"[request_id={request_id}] KV pressure test request.\n{base_prompt}"
+
+
 def run_non_stream_request(
     request_id: int,
     url: str,
@@ -295,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=os.getenv("VLLM_API_KEY", "EMPTY"))
     parser.add_argument("--model", default=os.getenv("VLLM_MODEL", "gemma4-e4b-it"))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--prompt-file", default=None, help="Load prompt text from file and override --prompt.")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--requests", type=int, default=40)
@@ -302,6 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--stream", action="store_true", help="Use stream mode and collect TTFT.")
+    parser.add_argument(
+        "--unique-prompt-per-request",
+        action="store_true",
+        help="Inject request_id prefix into prompt to reduce prefix-cache sharing between requests.",
+    )
     parser.add_argument("--strict-model", action="store_true", help="Fail if model not found in /models.")
     parser.add_argument("--out-dir", default="vllm_test/results")
     parser.add_argument("--name-prefix", default="gemma4_direct", help="Prefix for result folder name.")
@@ -315,6 +328,14 @@ def main() -> int:
         raise SystemExit("--requests must be > 0")
     if args.concurrency <= 0:
         raise SystemExit("--concurrency must be > 0")
+    prompt_text = args.prompt
+    if args.prompt_file:
+        prompt_path = Path(args.prompt_file)
+        if not prompt_path.exists():
+            raise SystemExit(f"--prompt-file not found: {prompt_path}")
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        if not prompt_text.strip():
+            raise SystemExit("--prompt-file content is empty")
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = Path(args.out_dir) / f"{args.name_prefix}_{ts}"
@@ -329,6 +350,8 @@ def main() -> int:
     print(f"requests={args.requests}")
     print(f"concurrency={args.concurrency}")
     print(f"stream={args.stream}")
+    print(f"unique_prompt_per_request={args.unique_prompt_per_request}")
+    print(f"prompt_chars={len(prompt_text)}")
     print(f"max_tokens={args.max_tokens}")
     print(f"timeout={args.timeout}s")
     print(f"out_dir={run_dir}")
@@ -347,7 +370,6 @@ def main() -> int:
 
     base_payload = {
         "model": args.model,
-        "messages": [{"role": "user", "content": args.prompt}],
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "stream": bool(args.stream),
@@ -360,6 +382,7 @@ def main() -> int:
         for i in range(1, args.warmup + 1):
             # stream_options is only valid when stream=true.
             warmup_payload = {k: v for k, v in base_payload.items() if k != "stream_options"}
+            warmup_payload["messages"] = [{"role": "user", "content": prompt_text}]
             warmup_payload["stream"] = False
             warmup_result = run_non_stream_request(
                 request_id=i,
@@ -379,6 +402,12 @@ def main() -> int:
 
     def worker(rid: int) -> None:
         payload = dict(base_payload)
+        payload["messages"] = [
+            {
+                "role": "user",
+                "content": build_prompt_for_request(prompt_text, rid, args.unique_prompt_per_request),
+            }
+        ]
         if args.stream:
             result = run_stream_request(rid, completion_url, headers, payload, args.timeout)
         else:
@@ -434,6 +463,8 @@ def main() -> int:
             "max_tokens": args.max_tokens,
             "timeout": args.timeout,
             "warmup": args.warmup,
+            "prompt_chars": len(prompt_text),
+            "unique_prompt_per_request": args.unique_prompt_per_request,
         },
         "metrics": {
             "total_requests": total_count,

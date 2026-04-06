@@ -11,13 +11,14 @@ SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-gemma4-e4b-it}
 PORT=${PORT:-8100}
 HOST=${HOST:-0.0.0.0}
 API_KEY=${API_KEY:-EMPTY}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.98}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-131072}
 ENABLE_ASYNC_SCHEDULING=${ENABLE_ASYNC_SCHEDULING:-1}
 GENERATION_CONFIG=${GENERATION_CONFIG:-vllm}
 LIMIT_MM_PER_PROMPT=${LIMIT_MM_PER_PROMPT:-}
-DEPLOY_PROFILE=${DEPLOY_PROFILE:-rag_text}
+DEPLOY_PROFILE=${DEPLOY_PROFILE:-full_featured}
 DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
 ENABLE_REASONING=${ENABLE_REASONING:-0}
 ENABLE_TOOL_CALLING=${ENABLE_TOOL_CALLING:-0}
@@ -29,17 +30,39 @@ unset VLLM_BASE_URL VLLM_MODEL LLM_PROVIDER VLLM_API_KEY
 
 case "$DEPLOY_PROFILE" in
   rag_text)
-    PROFILE_MM_DEFAULT='{"image":0,"audio":0}'
+    PROFILE_MM_DEFAULT='{"image":0,"audio":0,"video":0}'
     ;;
   vision)
-    PROFILE_MM_DEFAULT='{"image":2,"audio":0}'
+    PROFILE_MM_DEFAULT='{"image":2,"audio":0,"video":0}'
     ;;
   full)
-    PROFILE_MM_DEFAULT='{"image":4,"audio":1}'
+    PROFILE_MM_DEFAULT='{"image":4,"audio":1,"video":1}'
+    ;;
+  full_featured)
+    PROFILE_MM_DEFAULT='{"image":4,"audio":1,"video":1}'
+    ENABLE_REASONING=1
+    ENABLE_TOOL_CALLING=1
+    ENABLE_ASYNC_SCHEDULING=1
     ;;
   benchmark)
-    PROFILE_MM_DEFAULT='{"image":0,"audio":0}'
+    PROFILE_MM_DEFAULT='{"image":0,"audio":0,"video":0}'
     DISABLE_PREFIX_CACHING=1
+    ;;
+  extreme)
+    PROFILE_MM_DEFAULT='{"image":0,"audio":0,"video":0}'
+    DISABLE_PREFIX_CACHING=1
+    ENABLE_REASONING=0
+    ENABLE_TOOL_CALLING=0
+    # Aggressive defaults for stress testing. User env values still take priority.
+    if [[ "${GPU_MEMORY_UTILIZATION}" == "0.98" ]]; then
+      GPU_MEMORY_UTILIZATION=0.99
+    fi
+    if [[ "${MAX_NUM_SEQS}" == "32" ]]; then
+      MAX_NUM_SEQS=48
+    fi
+    if [[ "${MAX_NUM_BATCHED_TOKENS}" == "131072" ]]; then
+      MAX_NUM_BATCHED_TOKENS=262144
+    fi
     ;;
   *)
     echo "[WARN] Unknown DEPLOY_PROFILE='$DEPLOY_PROFILE', using custom LIMIT_MM_PER_PROMPT only."
@@ -50,6 +73,13 @@ esac
 if [[ -z "$LIMIT_MM_PER_PROMPT" && -n "${PROFILE_MM_DEFAULT:-}" ]]; then
   LIMIT_MM_PER_PROMPT="$PROFILE_MM_DEFAULT"
 fi
+
+trim_spaces() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
 
 CMD=(
   vllm serve "$MODEL_NAME"
@@ -66,6 +96,10 @@ CMD=(
 
 if [[ -n "$TENSOR_PARALLEL_SIZE" ]]; then
   CMD+=(--tensor-parallel-size "$TENSOR_PARALLEL_SIZE")
+fi
+
+if [[ -n "$MAX_NUM_BATCHED_TOKENS" ]]; then
+  CMD+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 fi
 
 if [[ "$ENABLE_ASYNC_SCHEDULING" == "1" ]]; then
@@ -89,36 +123,81 @@ if [[ -n "$MM_PROCESSOR_KWARGS" ]]; then
 fi
 
 if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
-  LIMIT_MM_ARG="$LIMIT_MM_PER_PROMPT"
+  LIMIT_MM_RAW="$(trim_spaces "$LIMIT_MM_PER_PROMPT")"
+  LIMIT_MM_WORK="$LIMIT_MM_RAW"
 
-  # vLLM expects JSON for --limit-mm-per-prompt on recent versions.
-  # Accept legacy "image=2,audio=0" format and convert it automatically.
-  if [[ "$LIMIT_MM_ARG" != \{* ]]; then
-    JSON_ITEMS=()
-    IFS=',' read -ra KV_PAIRS <<< "$LIMIT_MM_ARG"
-    for PAIR in "${KV_PAIRS[@]}"; do
+  # Accept:
+  # 1) JSON: {"image":4,"audio":1,"video":1}
+  # 2) relaxed braces: {image:4,audio:1,video:1}
+  # 3) legacy kv: image=4,audio=1,video=1
+  if [[ "$LIMIT_MM_WORK" == \{* && "$LIMIT_MM_WORK" == *\} ]]; then
+    LIMIT_MM_WORK="${LIMIT_MM_WORK#\{}"
+    LIMIT_MM_WORK="${LIMIT_MM_WORK%\}}"
+  fi
+
+  JSON_ITEMS=()
+  IFS=',' read -ra KV_PAIRS <<< "$LIMIT_MM_WORK"
+  for PAIR in "${KV_PAIRS[@]}"; do
+    PAIR="$(trim_spaces "$PAIR")"
+    if [[ -z "$PAIR" ]]; then
+      continue
+    fi
+
+    if [[ "$PAIR" == *"="* ]]; then
       KEY="${PAIR%%=*}"
       VALUE="${PAIR#*=}"
-      KEY="${KEY//[[:space:]]/}"
-      VALUE="${VALUE//[[:space:]]/}"
+    elif [[ "$PAIR" == *":"* ]]; then
+      KEY="${PAIR%%:*}"
+      VALUE="${PAIR#*:}"
+    else
+      echo "[ERROR] Invalid LIMIT_MM_PER_PROMPT entry: '$PAIR'"
+      echo "[ERROR] Use one of: '{\"image\":2,\"audio\":0,\"video\":0}' / '{image:2,audio:0,video:0}' / 'image=2,audio=0,video=0'"
+      exit 1
+    fi
 
-      if [[ -z "$KEY" || -z "$VALUE" ]]; then
-        echo "[ERROR] Invalid LIMIT_MM_PER_PROMPT entry: '$PAIR'"
-        echo "[ERROR] Use JSON (e.g. '{\"image\":2,\"audio\":0}') or legacy 'image=2,audio=0'"
-        exit 1
-      fi
+    KEY="$(trim_spaces "$KEY")"
+    VALUE="$(trim_spaces "$VALUE")"
 
-      if [[ ! "$VALUE" =~ ^[0-9]+$ ]]; then
-        echo "[ERROR] LIMIT_MM_PER_PROMPT value must be integer, got '$VALUE' for key '$KEY'"
-        exit 1
-      fi
+    if [[ ${#KEY} -ge 2 && "$KEY" == \"*\" ]]; then
+      KEY="${KEY:1:${#KEY}-2}"
+    fi
+    if [[ ${#KEY} -ge 2 && "$KEY" == \'*\' ]]; then
+      KEY="${KEY:1:${#KEY}-2}"
+    fi
+    if [[ ${#VALUE} -ge 2 && "$VALUE" == \"*\" ]]; then
+      VALUE="${VALUE:1:${#VALUE}-2}"
+    fi
+    if [[ ${#VALUE} -ge 2 && "$VALUE" == \'*\' ]]; then
+      VALUE="${VALUE:1:${#VALUE}-2}"
+    fi
 
-      JSON_ITEMS+=("\"$KEY\":$VALUE")
-    done
+    if [[ -z "$KEY" || -z "$VALUE" ]]; then
+      echo "[ERROR] Invalid LIMIT_MM_PER_PROMPT entry: '$PAIR'"
+      exit 1
+    fi
 
-    LIMIT_MM_ARG="{${JSON_ITEMS[*]}}"
-    LIMIT_MM_ARG="${LIMIT_MM_ARG// /,}"
-    echo "[INFO] Converted legacy LIMIT_MM_PER_PROMPT='$LIMIT_MM_PER_PROMPT' -> '$LIMIT_MM_ARG'"
+    if [[ ! "$KEY" =~ ^[a-zA-Z0-9_]+$ ]]; then
+      echo "[ERROR] LIMIT_MM_PER_PROMPT key must match [a-zA-Z0-9_], got '$KEY'"
+      exit 1
+    fi
+
+    if [[ ! "$VALUE" =~ ^[0-9]+$ ]]; then
+      echo "[ERROR] LIMIT_MM_PER_PROMPT value must be integer, got '$VALUE' for key '$KEY'"
+      exit 1
+    fi
+
+    JSON_ITEMS+=("\"$KEY\":$VALUE")
+  done
+
+  if [[ ${#JSON_ITEMS[@]} -eq 0 ]]; then
+    echo "[ERROR] LIMIT_MM_PER_PROMPT is empty after parsing: '$LIMIT_MM_PER_PROMPT'"
+    exit 1
+  fi
+
+  LIMIT_MM_ARG="{${JSON_ITEMS[*]}}"
+  LIMIT_MM_ARG="${LIMIT_MM_ARG// /,}"
+  if [[ "$LIMIT_MM_RAW" != "$LIMIT_MM_ARG" ]]; then
+    echo "[INFO] Normalized LIMIT_MM_PER_PROMPT='$LIMIT_MM_PER_PROMPT' -> '$LIMIT_MM_ARG'"
   fi
 
   CMD+=(--limit-mm-per-prompt "$LIMIT_MM_ARG")
@@ -126,7 +205,8 @@ fi
 
 echo "[INFO] Launch profile: $DEPLOY_PROFILE"
 echo "[INFO] Model: $MODEL_NAME (served as $SERVED_MODEL_NAME)"
-echo "[INFO] max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+echo "[INFO] max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-auto} gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
+echo "[INFO] async_scheduling=$ENABLE_ASYNC_SCHEDULING reasoning=$ENABLE_REASONING tool_calling=$ENABLE_TOOL_CALLING tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}"
 
 exec "${CMD[@]}" \
   "$@"

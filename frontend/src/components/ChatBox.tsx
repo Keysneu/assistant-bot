@@ -2,14 +2,14 @@ import { memo, useState, useRef, useEffect } from "react";
 import type { ComponentPropsWithoutRef, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Loader2, User, AlertCircle, Paperclip, X, Brain, Wrench, Info } from "lucide-react";
+import { Send, Loader2, User, AlertCircle, Paperclip, X, Brain, Wrench, Info, Mic, Square, Video } from "lucide-react";
 import type { ChatMessage, ChatModeConfigResponse } from "../types";
-import { streamMessage, getSession, getChatModeConfig, updateChatModeConfig } from "../lib/api";
+import { API, streamMessage, getSession, getChatModeConfig, uploadChatImage, uploadChatAudio, uploadChatVideo, resolveApiUrl } from "../lib/api";
 import { parseThinkingContent } from "../utils/thinkingParser";
 import { cn } from "../lib/utils";
 import { Button } from "./ui/Button";
 import { Skeleton } from "./ui/Skeleton";
-import { ImageUploader } from "./ImageUploader";
+import { ImageUploader, type SelectedImagePayload } from "./ImageUploader";
 import { Logo } from "./Logo";
 import {
   Dialog,
@@ -36,7 +36,7 @@ function isNetworkError(err: unknown): boolean {
   return false;
 }
 
-type DeployProfileKey = "rag_text" | "vision" | "full" | "benchmark";
+type DeployProfileKey = "rag_text" | "vision" | "full" | "full_featured" | "benchmark" | "extreme";
 type StreamDonePayload = {
   session_id?: string;
   full_content?: string;
@@ -45,7 +45,6 @@ type StreamDonePayload = {
   final_content?: string | null;
 };
 
-const PROFILE_ORDER: DeployProfileKey[] = ["rag_text", "vision", "full", "benchmark"];
 const STREAM_FLUSH_INTERVAL_MS = 50;
 const PROFILE_GUIDE: Record<
   DeployProfileKey,
@@ -53,28 +52,45 @@ const PROFILE_GUIDE: Record<
     title: string;
     description: string;
     supportsImage: boolean;
+    supportsAudio: boolean;
+    supportsVideo: boolean;
     supportsThinking: boolean;
     supportsToolCalling: boolean;
   }
 > = {
   rag_text: {
     title: "文本 RAG 档位",
-    description: "优先文本问答与检索，禁用图片与工具调用。",
+    description: "优先文本问答与检索，禁用图片/音频/视频与工具调用。",
     supportsImage: false,
+    supportsAudio: false,
+    supportsVideo: false,
     supportsThinking: true,
     supportsToolCalling: false,
   },
   vision: {
     title: "图文档位",
-    description: "开启图片理解，适合图文问答，不开启工具调用。",
+    description: "开启图片理解，适合图文问答，不开启音频/视频与工具调用。",
     supportsImage: true,
+    supportsAudio: false,
+    supportsVideo: false,
     supportsThinking: true,
     supportsToolCalling: false,
   },
   full: {
     title: "全能力档位",
-    description: "支持图片、Thinking 与 Tool Calling。",
+    description: "支持图片、音频、视频、Thinking 与 Tool Calling。",
     supportsImage: true,
+    supportsAudio: true,
+    supportsVideo: true,
+    supportsThinking: true,
+    supportsToolCalling: true,
+  },
+  full_featured: {
+    title: "全功能官方档位",
+    description: "对齐 Gemma4 full-featured 参数，开启图片、音频、视频、Thinking 与 Tool Calling。",
+    supportsImage: true,
+    supportsAudio: true,
+    supportsVideo: true,
     supportsThinking: true,
     supportsToolCalling: true,
   },
@@ -82,6 +98,17 @@ const PROFILE_GUIDE: Record<
     title: "压测档位",
     description: "用于稳定压测，关闭图片、Thinking 与 Tool Calling。",
     supportsImage: false,
+    supportsAudio: false,
+    supportsVideo: false,
+    supportsThinking: false,
+    supportsToolCalling: false,
+  },
+  extreme: {
+    title: "极限资源档位",
+    description: "最大化资源占用，关闭图片、Thinking 与 Tool Calling。",
+    supportsImage: false,
+    supportsAudio: false,
+    supportsVideo: false,
     supportsThinking: false,
     supportsToolCalling: false,
   },
@@ -136,6 +163,28 @@ const AssistantContent = memo(function AssistantContent({
     const normalizedReasoning = (reasoningContent || "").trim();
 
     if (!normalizedReasoning) {
+      const fallbackCandidate = normalizedFinal || content || "";
+      if (/^thought\s*/i.test(fallbackCandidate.trim())) {
+        const parsed = parseThinkingContent(fallbackCandidate);
+        const parsedReasoning = parsed?.reasoning?.trim() || "";
+        const parsedAnswer = parsed?.answer?.trim() || "";
+        if (parsedReasoning) {
+          return (
+            <div className="space-y-3">
+              <details className="rounded-lg border border-border/80 bg-muted/20 px-3 py-2">
+                <summary className="cursor-pointer list-none text-xs text-muted-foreground flex items-center gap-1.5">
+                  <Brain className="w-3.5 h-3.5" />
+                  <span>思考过程</span>
+                </summary>
+                <div className="mt-2 text-xs text-muted-foreground leading-relaxed">
+                  {renderMarkdown(parsedReasoning)}
+                </div>
+              </details>
+              {renderMarkdown(parsedAnswer || normalizedFinal)}
+            </div>
+          );
+        }
+      }
       if (isStreaming && !normalizedFinal) {
         return <span className="animate-pulse">...</span>;
       }
@@ -221,26 +270,40 @@ export function ChatBox({
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isBackendAvailable, setIsBackendAvailable] = useState(true);
   // Multimodal state
-  const [selectedImageData, setSelectedImageData] = useState("");
-  const [selectedImageFormat, setSelectedImageFormat] = useState("");
+  const [selectedImages, setSelectedImages] = useState<SelectedImagePayload[]>([]);
   const [selectedFileData, setSelectedFileData] = useState("");
   const [selectedFileName, setSelectedFileName] = useState("");
   const [selectedFileFormat, setSelectedFileFormat] = useState("");
+  const [selectedVideoFile, setSelectedVideoFile] = useState<File | null>(null);
+  const [selectedVideoName, setSelectedVideoName] = useState("");
+  const [selectedVideoPreviewUrl, setSelectedVideoPreviewUrl] = useState("");
+  const [selectedAudioFile, setSelectedAudioFile] = useState<File | null>(null);
+  const [selectedAudioName, setSelectedAudioName] = useState("");
+  const [selectedAudioPreviewUrl, setSelectedAudioPreviewUrl] = useState("");
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
+  const [recordingElapsedSeconds, setRecordingElapsedSeconds] = useState(0);
+  const [shouldAutoSubmitRecordedAudio, setShouldAutoSubmitRecordedAudio] = useState(false);
   const [enableThinkingMode, setEnableThinkingMode] = useState(false);
   const [enableToolCallingMode, setEnableToolCallingMode] = useState(false);
-  const [isSwitchingProfile, setIsSwitchingProfile] = useState(false);
   const [modeConfig, setModeConfig] = useState<ChatModeConfigResponse | null>(null);
   const [modeWarnings, setModeWarnings] = useState<string[]>([]);
   const [streamingAssistantIndex, setStreamingAssistantIndex] = useState<number | null>(null);
   const [streamingAssistantContent, setStreamingAssistantContent] = useState("");
   const [streamingThinkingPanelLocked, setStreamingThinkingPanelLocked] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
+  const audioInputRef = useRef<HTMLInputElement>(null);
   const hasAttemptedConnection = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
   const streamBufferRef = useRef("");
   const lastStreamFlushAtRef = useRef(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const loadModeConfig = async () => {
@@ -268,9 +331,18 @@ export function ChatBox({
             has_image: msg.has_image,
             image_data: msg.image_data,
             image_format: msg.image_format,
+            image_id: msg.image_id,
+            image_ids: msg.image_ids,
+            image_urls: msg.image_urls,
             has_file: msg.has_file,
             file_name: msg.file_name,
             file_format: msg.file_format,
+            has_audio: msg.has_audio,
+            audio_url: msg.audio_url,
+            audio_urls: msg.audio_urls,
+            has_video: msg.has_video,
+            video_url: msg.video_url,
+            video_urls: msg.video_urls,
             reasoning_content: msg.reasoning_content,
             final_content: msg.final_content,
           }));
@@ -312,15 +384,270 @@ export function ChatBox({
     }
   }, [streamingAssistantContent, streamingAssistantIndex]);
 
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+      if (mediaStreamRef.current) {
+        for (const track of mediaStreamRef.current.getTracks()) {
+          track.stop();
+        }
+        mediaStreamRef.current = null;
+      }
+      if (selectedAudioPreviewUrl && selectedAudioPreviewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(selectedAudioPreviewUrl);
+      }
+      if (selectedVideoPreviewUrl && selectedVideoPreviewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(selectedVideoPreviewUrl);
+      }
+    };
+  }, [selectedAudioPreviewUrl, selectedVideoPreviewUrl]);
+
   const scrollToBottom = () => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   };
 
+  const stopMediaStreamTracks = () => {
+    if (mediaStreamRef.current) {
+      for (const track of mediaStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      mediaStreamRef.current = null;
+    }
+  };
+
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  const formatRecordingDuration = (totalSeconds: number) => {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  };
+
+  const resetSelectedAudio = () => {
+    if (selectedAudioPreviewUrl && selectedAudioPreviewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(selectedAudioPreviewUrl);
+    }
+    setSelectedAudioFile(null);
+    setSelectedAudioName("");
+    setSelectedAudioPreviewUrl("");
+    if (audioInputRef.current) {
+      audioInputRef.current.value = "";
+    }
+  };
+
+  const resetSelectedVideo = () => {
+    if (selectedVideoPreviewUrl && selectedVideoPreviewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(selectedVideoPreviewUrl);
+    }
+    setSelectedVideoFile(null);
+    setSelectedVideoName("");
+    setSelectedVideoPreviewUrl("");
+    if (videoInputRef.current) {
+      videoInputRef.current.value = "";
+    }
+  };
+
+  const setSelectedVideoFromFile = (file: File) => {
+    const previousUrl = selectedVideoPreviewUrl;
+    const nextUrl = URL.createObjectURL(file);
+    if (previousUrl && previousUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(previousUrl);
+    }
+    setSelectedVideoFile(file);
+    setSelectedVideoName(file.name);
+    setSelectedVideoPreviewUrl(nextUrl);
+  };
+
+  const setSelectedAudioFromFile = (file: File) => {
+    const previousUrl = selectedAudioPreviewUrl;
+    const nextUrl = URL.createObjectURL(file);
+    if (previousUrl && previousUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(previousUrl);
+    }
+    setSelectedAudioFile(file);
+    setSelectedAudioName(file.name);
+    setSelectedAudioPreviewUrl(nextUrl);
+  };
+
+  const handleSelectVideoFile = (file: File | null) => {
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith("video/")) {
+      alert("请选择视频文件");
+      return;
+    }
+    if (file.size > 256 * 1024 * 1024) {
+      alert("视频大小不能超过 256MB");
+      return;
+    }
+
+    setSelectedVideoFromFile(file);
+    if (videoInputRef.current) {
+      videoInputRef.current.value = "";
+    }
+  };
+
+  const resolveRecordingExtension = (mimeType: string) => {
+    const normalized = mimeType.toLowerCase();
+    if (normalized.includes("ogg")) return "ogg";
+    if (normalized.includes("mp4")) return "m4a";
+    if (normalized.includes("mpeg") || normalized.includes("mp3")) return "mp3";
+    if (normalized.includes("wav")) return "wav";
+    return "webm";
+  };
+
+  const startAudioRecording = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert("当前浏览器不支持录音");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const preferredMimeTypes = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus",
+      ];
+      const selectedMimeType = preferredMimeTypes.find((item) => MediaRecorder.isTypeSupported(item)) || "";
+      const recorder = selectedMimeType
+        ? new MediaRecorder(stream, { mimeType: selectedMimeType })
+        : new MediaRecorder(stream);
+
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        clearRecordingTimer();
+        setIsRecordingAudio(false);
+        const chunkList = [...audioChunksRef.current];
+        audioChunksRef.current = [];
+        stopMediaStreamTracks();
+        if (!chunkList.length) {
+          return;
+        }
+        const finalMimeType = recorder.mimeType || "audio/webm";
+        const audioBlob = new Blob(chunkList, { type: finalMimeType });
+        const extension = resolveRecordingExtension(finalMimeType);
+        const audioFile = new File([audioBlob], `voice-${Date.now()}.${extension}`, {
+          type: finalMimeType,
+        });
+        setSelectedAudioFromFile(audioFile);
+        setShouldAutoSubmitRecordedAudio(true);
+      };
+
+      mediaRecorderRef.current = recorder;
+      clearRecordingTimer();
+      setRecordingElapsedSeconds(0);
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingElapsedSeconds((value) => value + 1);
+      }, 1000);
+      recorder.start(250);
+      setIsRecordingAudio(true);
+    } catch (error) {
+      stopMediaStreamTracks();
+      clearRecordingTimer();
+      setIsRecordingAudio(false);
+      console.error("录音启动失败:", error);
+      alert("无法启动录音，请检查麦克风权限");
+    }
+  };
+
+  const stopAudioRecording = () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) {
+      setIsRecordingAudio(false);
+      stopMediaStreamTracks();
+      return;
+    }
+    if (recorder.state !== "inactive") {
+      recorder.stop();
+    } else {
+      clearRecordingTimer();
+      setIsRecordingAudio(false);
+      stopMediaStreamTracks();
+    }
+  };
+
+  const toggleAudioRecording = async () => {
+    if (isRecordingAudio) {
+      stopAudioRecording();
+      return;
+    }
+    await startAudioRecording();
+  };
+
+  const handleSelectAudioFile = (file: File | null) => {
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith("audio/")) {
+      alert("请选择音频文件");
+      return;
+    }
+    if (file.size > 32 * 1024 * 1024) {
+      alert("音频大小不能超过 32MB");
+      return;
+    }
+
+    setShouldAutoSubmitRecordedAudio(false);
+    setSelectedAudioFromFile(file);
+    if (audioInputRef.current) {
+      audioInputRef.current.value = "";
+    }
+  };
+
+  useEffect(() => {
+    if (!shouldAutoSubmitRecordedAudio) {
+      return;
+    }
+    if (!selectedAudioFile || isLoading || !isBackendAvailable) {
+      return;
+    }
+    setShouldAutoSubmitRecordedAudio(false);
+    window.setTimeout(() => {
+      formRef.current?.requestSubmit();
+    }, 0);
+  }, [shouldAutoSubmitRecordedAudio, selectedAudioFile, isLoading, isBackendAvailable]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if ((!input.trim() && !selectedImageData && !selectedFileData) || isLoading) return;
+    setShouldAutoSubmitRecordedAudio(false);
+    if ((!input.trim() && selectedImages.length === 0 && !selectedFileData && !selectedAudioFile && !selectedVideoFile) || isLoading) return;
+    if (selectedAudioFile && modeConfig?.supports_audio === false) {
+      setModeWarnings((prev) => {
+        const next = [...prev, `当前档位 ${modeConfig.deploy_profile} 不支持音频输入`];
+        return Array.from(new Set(next));
+      });
+      return;
+    }
+    if (selectedVideoFile && modeConfig?.supports_video === false) {
+      setModeWarnings((prev) => {
+        const next = [...prev, `当前档位 ${modeConfig.deploy_profile} 不支持视频输入`];
+        return Array.from(new Set(next));
+      });
+      return;
+    }
 
     if (!isBackendAvailable) {
       setIsLoading(true);
@@ -336,11 +663,14 @@ export function ChatBox({
         setIsLoading(false);
       }, 500);
       setInput("");
-      setSelectedImageData("");
-      setSelectedImageFormat("");
+      setSelectedImages([]);
       setSelectedFileData("");
       setSelectedFileName("");
       setSelectedFileFormat("");
+      resetSelectedAudio();
+      resetSelectedVideo();
+      clearRecordingTimer();
+      setRecordingElapsedSeconds(0);
       return;
     }
 
@@ -348,26 +678,35 @@ export function ChatBox({
       role: "user",
       content: input.trim(),
       timestamp: new Date(),
-      has_image: !!selectedImageData,
-      image_data: selectedImageData || undefined,
-      image_format: selectedImageFormat || undefined,
+      has_image: selectedImages.length > 0,
+      image_url: selectedImages[0]?.previewDataUrl || undefined,
+      image_urls: selectedImages.map((item) => item.previewDataUrl),
+      image_format: selectedImages[0]?.format || undefined,
       has_file: !!selectedFileData,
       file_name: selectedFileName || undefined,
       file_format: selectedFileFormat || undefined,
+      has_audio: !!selectedAudioFile,
+      audio_url: undefined,
+      has_video: !!selectedVideoFile,
+      video_url: undefined,
     };
     const messageToSend = input.trim();
-    const imageDataToSend = selectedImageData;
-    const imageFormatToSend = selectedImageFormat;
+    const imagePayloadsToSend = selectedImages;
     const fileDataToSend = selectedFileData;
     const fileNameToSend = selectedFileName;
     const fileFormatToSend = selectedFileFormat;
+    const audioFileToSend = selectedAudioFile;
+    const videoFileToSend = selectedVideoFile;
 
     setInput("");
-    setSelectedImageData("");
-    setSelectedImageFormat("");
+    setSelectedImages([]);
     setSelectedFileData("");
     setSelectedFileName("");
     setSelectedFileFormat("");
+    resetSelectedAudio();
+    resetSelectedVideo();
+    clearRecordingTimer();
+    setRecordingElapsedSeconds(0);
     setIsLoading(true);
 
     const assistantMessage: ChatMessage = {
@@ -386,19 +725,64 @@ export function ChatBox({
     try {
       let fullResponse = "";
       const streamResult: { done: StreamDonePayload | null } = { done: null };
+      let uploadedImageIds: string[] = [];
+      let uploadedImageFormat = imagePayloadsToSend[0]?.format || "jpeg";
+      let uploadedAudioUrl: string | undefined;
+      let uploadedVideoUrl: string | undefined;
       setModeWarnings([]);
+
+      if (imagePayloadsToSend.length > 0) {
+        const uploadResults = await Promise.all(
+          imagePayloadsToSend.map((item) => uploadChatImage(item.file))
+        );
+        uploadedImageIds = uploadResults.map((item) => item.image_id).filter(Boolean);
+        uploadedImageFormat = uploadResults[0]?.image_format || uploadedImageFormat;
+      }
+      if (audioFileToSend) {
+        const audioUploadResult = await uploadChatAudio(audioFileToSend);
+        const uploadedAudioLocalUrl = `/api/chat/audios/${audioUploadResult.audio_id}`;
+        uploadedAudioUrl = uploadedAudioLocalUrl;
+        setMessages((prev) => {
+          const next = [...prev];
+          const userIndex = assistantIndex - 1;
+          if (userIndex >= 0 && userIndex < next.length && next[userIndex]?.role === "user") {
+            next[userIndex] = {
+              ...next[userIndex],
+              audio_url: uploadedAudioLocalUrl,
+              audio_urls: [uploadedAudioLocalUrl],
+            };
+          }
+          return next;
+        });
+      }
+      if (videoFileToSend) {
+        const videoUploadResult = await uploadChatVideo(videoFileToSend);
+        const uploadedVideoLocalUrl = `/api/chat/videos/${videoUploadResult.video_id}`;
+        uploadedVideoUrl = uploadedVideoLocalUrl;
+        setMessages((prev) => {
+          const next = [...prev];
+          const userIndex = assistantIndex - 1;
+          if (userIndex >= 0 && userIndex < next.length && next[userIndex]?.role === "user") {
+            next[userIndex] = {
+              ...next[userIndex],
+              video_url: uploadedVideoLocalUrl,
+              video_urls: [uploadedVideoLocalUrl],
+            };
+          }
+          return next;
+        });
+      }
 
       for await (const token of streamMessage(
         messageToSend,
         sessionId,
-        imageDataToSend,
-        imageFormatToSend,
+        uploadedImageIds.length === 1 ? uploadedImageIds[0] : undefined,
+        uploadedImageFormat,
         fileDataToSend,
         fileNameToSend,
         fileFormatToSend,
         modeConfig?.supports_thinking ? enableThinkingMode : false,
         modeConfig?.supports_tool_calling ? enableToolCallingMode : false,
-        modeConfig?.deploy_profile,
         (metadata) => {
           const newSessionId = metadata.session_id;
           if (onSessionChange && newSessionId && newSessionId !== sessionId) {
@@ -410,9 +794,29 @@ export function ChatBox({
           if (typeof metadata.enable_thinking === "boolean") {
             setStreamingThinkingPanelLocked(metadata.enable_thinking);
           }
-          if (imageDataToSend && metadata.multimodal_mode && metadata.multimodal_mode !== "gemma4_native") {
+          const multimodalMode = String(metadata.multimodal_mode || "");
+          const usesGemma4NativeImagePath = (
+            multimodalMode === "gemma4_native"
+            || multimodalMode === "gemma4_native_image"
+            || multimodalMode === "gemma4_native_image_audio"
+            || multimodalMode === "gemma4_native_image_video"
+            || multimodalMode === "gemma4_native_image_video_audio"
+          );
+          if (uploadedImageIds.length > 0 && multimodalMode && !usesGemma4NativeImagePath) {
             setModeWarnings((prev) => {
-              const next = [...prev, `图片请求未走 Gemma4 原生多模态链路（当前: ${metadata.multimodal_mode}）`];
+              const next = [...prev, `图片请求未走 Gemma4 原生多模态链路（当前: ${multimodalMode}）`];
+              return Array.from(new Set(next));
+            });
+          }
+          if (uploadedAudioUrl && multimodalMode && !multimodalMode.includes("audio")) {
+            setModeWarnings((prev) => {
+              const next = [...prev, `音频请求未走 Gemma4 原生音频链路（当前: ${multimodalMode}）`];
+              return Array.from(new Set(next));
+            });
+          }
+          if (uploadedVideoUrl && multimodalMode && !multimodalMode.includes("video")) {
+            setModeWarnings((prev) => {
+              const next = [...prev, `视频请求未走 Gemma4 原生视频链路（当前: ${multimodalMode}）`];
               return Array.from(new Set(next));
             });
           }
@@ -420,6 +824,10 @@ export function ChatBox({
         (done) => {
           streamResult.done = done;
         },
+        uploadedImageIds.length > 1 ? uploadedImageIds : undefined,
+        uploadedAudioUrl,
+        undefined,
+        uploadedVideoUrl,
       )) {
         fullResponse += token;
         streamBufferRef.current = fullResponse;
@@ -430,9 +838,36 @@ export function ChatBox({
         }
       }
 
-      const displayContent = streamResult.done?.display_content || streamResult.done?.final_content || fullResponse;
-      const reasoningContent = streamResult.done?.reasoning_content || undefined;
-      const finalContent = streamResult.done?.final_content || streamResult.done?.display_content || displayContent;
+      const rawFullContent = (streamResult.done?.full_content || fullResponse || "").trim();
+      const doneDisplayContent = (streamResult.done?.display_content || "").trim();
+      const doneReasoningContent = (streamResult.done?.reasoning_content || "").trim();
+      const doneFinalContent = (streamResult.done?.final_content || "").trim();
+
+      let reasoningContent = doneReasoningContent || undefined;
+      let finalContent = doneFinalContent || doneDisplayContent || rawFullContent;
+      let displayContent = doneDisplayContent || doneFinalContent || rawFullContent;
+
+      if (!reasoningContent && /^thought\s*/i.test(rawFullContent)) {
+        const parsed = parseThinkingContent(rawFullContent);
+        const parsedReasoning = parsed?.reasoning?.trim() || "";
+        const parsedAnswer = parsed?.answer?.trim() || "";
+        if (parsedReasoning) {
+          reasoningContent = parsedReasoning;
+          if (!doneFinalContent && parsedAnswer) {
+            finalContent = parsedAnswer;
+          }
+          if (!doneDisplayContent && parsedAnswer) {
+            displayContent = parsedAnswer;
+          }
+        }
+      }
+
+      if (!finalContent) {
+        finalContent = displayContent || rawFullContent;
+      }
+      if (!displayContent) {
+        displayContent = finalContent || rawFullContent;
+      }
       setStreamingAssistantContent(fullResponse);
       setMessages((prev) => {
         const newMessages = [...prev];
@@ -499,42 +934,6 @@ export function ChatBox({
     }
   };
 
-  const switchableProfiles = (modeConfig?.available_profiles || PROFILE_ORDER).filter(
-    (profile): profile is DeployProfileKey => profile in PROFILE_GUIDE
-  );
-
-  const handleSwitchProfile = async (targetProfile: DeployProfileKey) => {
-    if (!modeConfig || modeConfig.provider !== "vllm") {
-      return;
-    }
-    if (modeConfig.deploy_profile === targetProfile) {
-      return;
-    }
-
-    setIsSwitchingProfile(true);
-    try {
-      const updated = await updateChatModeConfig(targetProfile);
-      setModeConfig(updated);
-      setModeWarnings([]);
-
-      if (!updated.supports_image) {
-        setSelectedImageData("");
-        setSelectedImageFormat("");
-      }
-      if (!updated.supports_thinking) {
-        setEnableThinkingMode(false);
-      }
-      if (!updated.supports_tool_calling) {
-        setEnableToolCallingMode(false);
-      }
-    } catch (error) {
-      console.error("切换模式失败:", error);
-      alert(`切换模式失败：${error instanceof Error ? error.message : "未知错误"}`);
-    } finally {
-      setIsSwitchingProfile(false);
-    }
-  };
-
   const handleSelectFile = async (file: File | null) => {
     if (!file) {
       return;
@@ -547,8 +946,8 @@ export function ChatBox({
       return;
     }
 
-    if (file.size > 6 * 1024 * 1024) {
-      alert("文件大小不能超过 6MB");
+    if (file.size > 64 * 1024 * 1024) {
+      alert("文件大小不能超过 64MB");
       return;
     }
 
@@ -589,6 +988,40 @@ export function ChatBox({
     }
   };
 
+  const resolveMessageAudioSources = (msg: ChatMessage): string[] => {
+    const sources: string[] = [];
+    if (Array.isArray(msg.audio_urls) && msg.audio_urls.length > 0) {
+      sources.push(...msg.audio_urls);
+    }
+    if (msg.audio_url) {
+      sources.push(msg.audio_url);
+    }
+    return Array.from(
+      new Set(
+        sources
+          .map((item) => resolveApiUrl(item) || item)
+          .filter((item) => Boolean(item) && !String(item).startsWith("blob:"))
+      )
+    );
+  };
+
+  const resolveMessageVideoSources = (msg: ChatMessage): string[] => {
+    const sources: string[] = [];
+    if (Array.isArray(msg.video_urls) && msg.video_urls.length > 0) {
+      sources.push(...msg.video_urls);
+    }
+    if (msg.video_url) {
+      sources.push(msg.video_url);
+    }
+    return Array.from(
+      new Set(
+        sources
+          .map((item) => resolveApiUrl(item) || item)
+          .filter((item) => Boolean(item) && !String(item).startsWith("blob:"))
+      )
+    );
+  };
+
   const currentProfileGuide =
     modeConfig?.deploy_profile && modeConfig.deploy_profile in PROFILE_GUIDE
       ? PROFILE_GUIDE[modeConfig.deploy_profile as DeployProfileKey]
@@ -598,10 +1031,22 @@ export function ChatBox({
     ? "后端服务未连接"
     : isLoading
       ? "正在生成回复，请稍候"
-      : isSwitchingProfile
-        ? "正在切换模式，请稍候"
       : modeConfig?.supports_image === false
-        ? `当前档位 ${modeConfig.deploy_profile} 不支持图片，请切换到 vision 或 full`
+        ? `当前服务端档位 ${modeConfig.deploy_profile} 不支持图片，请修改 VLLM_DEPLOY_PROFILE 后重启服务`
+        : undefined;
+  const audioUploadDisabledReason = !isBackendAvailable
+    ? "后端服务未连接"
+    : isLoading
+      ? "正在生成回复，请稍候"
+      : modeConfig?.supports_audio === false
+        ? `当前服务端档位 ${modeConfig.deploy_profile} 不支持音频，请修改 VLLM_DEPLOY_PROFILE 后重启服务`
+        : undefined;
+  const videoUploadDisabledReason = !isBackendAvailable
+    ? "后端服务未连接"
+    : isLoading
+      ? "正在生成回复，请稍候"
+      : modeConfig?.supports_video === false
+        ? `当前服务端档位 ${modeConfig.deploy_profile} 不支持视频，请修改 VLLM_DEPLOY_PROFILE 后重启服务`
         : undefined;
 
   const capabilityBadgeClass = (enabled: boolean) =>
@@ -685,15 +1130,92 @@ export function ChatBox({
                     )}
                   >
                     {/* Display image if present */}
-                    {msg.has_image && msg.image_data && (
-                      <div className="mb-3 rounded-lg overflow-hidden">
-                        <img
-                          src={`data:image/${msg.image_format || "png"};base64,${msg.image_data}`}
-                          alt="Uploaded image"
-                          className="max-w-full h-auto rounded-lg"
-                        />
-                      </div>
-                    )}
+                    {msg.has_image && (() => {
+                      const imageSources: string[] = [];
+                      if (Array.isArray(msg.image_urls) && msg.image_urls.length > 0) {
+                        imageSources.push(...msg.image_urls);
+                      }
+                      if (msg.image_url) {
+                        imageSources.push(msg.image_url);
+                      }
+                      if (msg.image_data) {
+                        imageSources.push(
+                          msg.image_data.startsWith("data:image/")
+                            ? msg.image_data
+                            : `data:image/${msg.image_format || "png"};base64,${msg.image_data}`
+                        );
+                      }
+                      if (Array.isArray(msg.image_ids) && msg.image_ids.length > 0) {
+                        imageSources.push(...msg.image_ids.map((id) => API.chatImage(id)));
+                      } else if (msg.image_id) {
+                        imageSources.push(API.chatImage(msg.image_id));
+                      }
+                      const uniqueSources = Array.from(new Set(imageSources.filter(Boolean)));
+                      if (!uniqueSources.length) {
+                        return null;
+                      }
+                      return (
+                        <div className="mb-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {uniqueSources.map((src, imageIndex) => (
+                            <div key={`${src}-${imageIndex}`} className="rounded-lg overflow-hidden">
+                              <img
+                                src={src}
+                                alt={`Uploaded image ${imageIndex + 1}`}
+                                className="max-w-full h-auto rounded-lg"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                    {msg.has_audio && (() => {
+                      const audioSources = resolveMessageAudioSources(msg);
+                      if (!audioSources.length) {
+                        return (
+                          <div className="mb-3 inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted text-xs border border-border">
+                            <Mic className="w-3 h-3" />
+                            <span>语音输入</span>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div className="mb-3 space-y-2">
+                          {audioSources.map((src, audioIndex) => (
+                            <audio
+                              key={`${src}-${audioIndex}`}
+                              controls
+                              preload="metadata"
+                              className="w-full min-w-[220px] max-w-[420px]"
+                              src={src}
+                            />
+                          ))}
+                        </div>
+                      );
+                    })()}
+                    {msg.has_video && (() => {
+                      const videoSources = resolveMessageVideoSources(msg);
+                      if (!videoSources.length) {
+                        return (
+                          <div className="mb-3 inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted text-xs border border-border">
+                            <Video className="w-3 h-3" />
+                            <span>视频输入</span>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div className="mb-3 space-y-2">
+                          {videoSources.map((src, videoIndex) => (
+                            <video
+                              key={`${src}-${videoIndex}`}
+                              controls
+                              preload="metadata"
+                              className="w-full min-w-[220px] max-w-[420px] rounded-lg"
+                              src={src}
+                            />
+                          ))}
+                        </div>
+                      );
+                    })()}
                     {msg.role === "assistant" ? (
                       <div className="text-sm leading-relaxed">
                         {(() => {
@@ -743,6 +1265,7 @@ export function ChatBox({
       {/* Input Area */}
       <div className="flex-shrink-0 p-4 bg-background/80 backdrop-blur-sm border-t border-border z-10">
         <form
+          ref={formRef}
           onSubmit={handleSubmit}
           className="max-w-3xl mx-auto relative group"
         >
@@ -753,7 +1276,7 @@ export function ChatBox({
               size="sm"
               className="h-8 gap-1.5"
               onClick={() => setEnableThinkingMode((value) => !value)}
-              disabled={isLoading || isSwitchingProfile || !isBackendAvailable || modeConfig?.supports_thinking === false}
+              disabled={isLoading || !isBackendAvailable || modeConfig?.supports_thinking === false}
               title={
                 modeConfig?.supports_thinking === false
                   ? `当前档位 ${modeConfig.deploy_profile} 不支持 Thinking`
@@ -769,7 +1292,7 @@ export function ChatBox({
               size="sm"
               className="h-8 gap-1.5"
               onClick={() => setEnableToolCallingMode((value) => !value)}
-              disabled={isLoading || isSwitchingProfile || !isBackendAvailable || modeConfig?.supports_tool_calling === false}
+              disabled={isLoading || !isBackendAvailable || modeConfig?.supports_tool_calling === false}
               title={
                 modeConfig?.supports_tool_calling === false
                   ? `当前档位 ${modeConfig.deploy_profile} 不支持 Tool Calling`
@@ -796,69 +1319,37 @@ export function ChatBox({
                     <DialogTitle>Deploy Profile 说明</DialogTitle>
                     <DialogDescription>
                       当前后端档位：<span className="font-medium text-foreground">{modeConfig.deploy_profile}</span>
-                      。图片上传是否可用由该档位决定。
+                      。该档位由 vLLM 启动参数决定，运行中不可切换。
                     </DialogDescription>
                   </DialogHeader>
                   <div className="space-y-2.5">
-                    {PROFILE_ORDER.map((profileKey) => {
-                      const profile = PROFILE_GUIDE[profileKey];
-                      const isActive = modeConfig.deploy_profile === profileKey;
-                      return (
-                        <div
-                          key={profileKey}
-                          className={cn(
-                            "rounded-lg border p-3",
-                            isActive ? "border-primary/50 bg-primary/5" : "border-border bg-card"
-                          )}
-                        >
-                          <div className="flex items-center justify-between gap-2 mb-1">
-                            <div className="text-sm font-medium text-foreground">
-                              {profileKey}
-                              {isActive && (
-                                <span className="ml-2 text-[11px] text-primary">当前</span>
-                              )}
-                            </div>
-                            <div className="text-[11px] text-muted-foreground">{profile.title}</div>
+                    {currentProfileGuide && (
+                      <div className="rounded-lg border p-3 border-primary/50 bg-primary/5">
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <div className="text-sm font-medium text-foreground">
+                            {modeConfig.deploy_profile}
+                            <span className="ml-2 text-[11px] text-primary">当前</span>
                           </div>
-                          <p className="text-xs text-muted-foreground mb-2">{profile.description}</p>
-                          <div className="flex flex-wrap gap-1.5">
-                            <span className={capabilityBadgeClass(profile.supportsImage)}>Image</span>
-                            <span className={capabilityBadgeClass(profile.supportsThinking)}>Thinking</span>
-                            <span className={capabilityBadgeClass(profile.supportsToolCalling)}>Tool Calling</span>
-                          </div>
+                          <div className="text-[11px] text-muted-foreground">{currentProfileGuide.title}</div>
                         </div>
-                      );
-                    })}
+                        <p className="text-xs text-muted-foreground mb-2">{currentProfileGuide.description}</p>
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className={capabilityBadgeClass(currentProfileGuide.supportsImage)}>Image</span>
+                          <span className={capabilityBadgeClass(currentProfileGuide.supportsAudio)}>Audio</span>
+                          <span className={capabilityBadgeClass(currentProfileGuide.supportsVideo)}>Video</span>
+                          <span className={capabilityBadgeClass(currentProfileGuide.supportsThinking)}>Thinking</span>
+                          <span className={capabilityBadgeClass(currentProfileGuide.supportsToolCalling)}>Tool Calling</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <p className="mt-3 text-xs text-muted-foreground">
-                    可直接点击输入框上方的档位按钮进行运行时切换。若服务端实际部署能力不足，
-                    后端会返回明确错误提示。
+                    若需变更能力，请修改服务器启动环境中的 `VLLM_DEPLOY_PROFILE` 并重启 vLLM。
                   </p>
                 </DialogContent>
               </Dialog>
             )}
           </div>
-          {modeConfig?.provider === "vllm" && switchableProfiles.length > 0 && (
-            <div className="mb-2 flex flex-wrap items-center gap-1.5">
-              {switchableProfiles.map((profileKey) => (
-                <Button
-                  key={profileKey}
-                  type="button"
-                  size="sm"
-                  variant={modeConfig.deploy_profile === profileKey ? "default" : "outline"}
-                  className="h-7 px-2.5 text-xs"
-                  disabled={isLoading || isSwitchingProfile || !isBackendAvailable}
-                  onClick={() => handleSwitchProfile(profileKey)}
-                  title={`切换到 ${profileKey}`}
-                >
-                  {profileKey}
-                </Button>
-              ))}
-              {isSwitchingProfile && (
-                <span className="text-[11px] text-muted-foreground">正在切换...</span>
-              )}
-            </div>
-          )}
           {modeWarnings.length > 0 && (
             <div className="mb-2 text-xs text-amber-600">
               {modeWarnings.join("；")}
@@ -866,12 +1357,27 @@ export function ChatBox({
           )}
           {modeConfig?.supports_image === false && (
             <div className="mb-2 text-xs text-amber-600">
-              当前 Profile `{modeConfig.deploy_profile}` 已关闭图片输入。切换到 `vision` / `full` 后可上传图片。
+              当前 Profile `{modeConfig.deploy_profile}` 已关闭图片输入。请调整服务器 `VLLM_DEPLOY_PROFILE` 并重启后再使用图片。
+            </div>
+          )}
+          {modeConfig?.supports_audio === false && (
+            <div className="mb-2 text-xs text-amber-600">
+              当前 Profile `{modeConfig.deploy_profile}` 已关闭音频输入。请调整服务器 `VLLM_DEPLOY_PROFILE` 并重启后再使用语音。
+            </div>
+          )}
+          {modeConfig?.supports_video === false && (
+            <div className="mb-2 text-xs text-amber-600">
+              当前 Profile `{modeConfig.deploy_profile}` 已关闭视频输入。请调整服务器 `VLLM_DEPLOY_PROFILE` 并重启后再使用视频理解。
+            </div>
+          )}
+          {isRecordingAudio && (
+            <div className="mb-2 text-xs text-rose-600">
+              录音中 {formatRecordingDuration(recordingElapsedSeconds)}，点击方块停止后将自动发送给 Gemma4
             </div>
           )}
           {currentProfileGuide && (
             <div className="mb-2 text-[11px] text-muted-foreground">
-              当前档位能力：Image {currentProfileGuide.supportsImage ? "ON" : "OFF"} / Thinking {currentProfileGuide.supportsThinking ? "ON" : "OFF"} / Tool Calling {currentProfileGuide.supportsToolCalling ? "ON" : "OFF"}
+              当前档位能力：Image {currentProfileGuide.supportsImage ? "ON" : "OFF"} / Audio {currentProfileGuide.supportsAudio ? "ON" : "OFF"} / Video {currentProfileGuide.supportsVideo ? "ON" : "OFF"} / Thinking {currentProfileGuide.supportsThinking ? "ON" : "OFF"} / Tool Calling {currentProfileGuide.supportsToolCalling ? "ON" : "OFF"}
             </div>
           )}
           <input
@@ -879,24 +1385,40 @@ export function ChatBox({
             type="file"
             accept=".txt,.md,.markdown,.pdf,.csv,.json,.log"
             className="hidden"
-            disabled={isLoading || isSwitchingProfile || !isBackendAvailable}
+            disabled={isLoading || !isBackendAvailable}
             onChange={(e) => handleSelectFile(e.target.files?.[0] || null)}
+          />
+          <input
+            ref={videoInputRef}
+            type="file"
+            accept="video/*"
+            className="hidden"
+            disabled={isLoading || !isBackendAvailable || modeConfig?.supports_video === false}
+            onChange={(e) => handleSelectVideoFile(e.target.files?.[0] || null)}
+          />
+          <input
+            ref={audioInputRef}
+            type="file"
+            accept="audio/*"
+            className="hidden"
+            disabled={isLoading || !isBackendAvailable || modeConfig?.supports_audio === false}
+            onChange={(e) => handleSelectAudioFile(e.target.files?.[0] || null)}
           />
           <div className="flex items-end gap-4">
             {/* Image uploader - 独立在输入框左侧 */}
             <div className="flex-shrink-0">
               <ImageUploader
-                onImageSelect={(data, format) => {
-                  setSelectedImageData(data);
-                  setSelectedImageFormat(format);
+                value={selectedImages}
+                onImagesChange={(payloads: SelectedImagePayload[]) => {
+                  setSelectedImages(payloads);
                 }}
                 disabled={
                   isLoading ||
-                  isSwitchingProfile ||
                   !isBackendAvailable ||
                   modeConfig?.supports_image === false
                 }
                 disabledReason={imageUploadDisabledReason}
+                maxImages={4}
               />
             </div>
 
@@ -906,7 +1428,7 @@ export function ChatBox({
                 size="icon"
                 variant="outline"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={isLoading || isSwitchingProfile || !isBackendAvailable}
+                disabled={isLoading || !isBackendAvailable}
                 className={cn(
                   "h-12 w-12 rounded-2xl shadow-sm",
                   selectedFileData && "border-primary text-primary"
@@ -916,15 +1438,112 @@ export function ChatBox({
                 <Paperclip className="w-5 h-5" />
               </Button>
             </div>
+            <div className="flex-shrink-0">
+              <Button
+                type="button"
+                size="icon"
+                variant="outline"
+                onClick={() => videoInputRef.current?.click()}
+                disabled={Boolean(videoUploadDisabledReason)}
+                className={cn(
+                  "h-12 w-12 rounded-2xl shadow-sm",
+                  selectedVideoFile && "border-primary text-primary"
+                )}
+                title={videoUploadDisabledReason || "上传视频文件"}
+              >
+                <Video className="w-5 h-5" />
+              </Button>
+            </div>
+            <div className="flex-shrink-0">
+              <Button
+                type="button"
+                size="icon"
+                variant={isRecordingAudio ? "default" : "outline"}
+                onClick={toggleAudioRecording}
+                disabled={Boolean(audioUploadDisabledReason)}
+                className="h-12 w-12 rounded-2xl shadow-sm"
+                title={audioUploadDisabledReason || (isRecordingAudio ? "停止录音并自动发送" : "开始录音")}
+              >
+                {isRecordingAudio ? <Square className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+              </Button>
+            </div>
 
             {/* Input wrapper */}
             <div className={cn(
-              "relative flex-1 flex items-end bg-card border border-input rounded-2xl shadow-lg transition-all duration-300",
+              "relative flex-1 flex flex-col bg-card border border-input rounded-2xl shadow-lg transition-all duration-300",
               "focus-within:ring-2 focus-within:ring-ring focus-within:border-primary/50 focus-within:shadow-xl",
               "hover:border-primary/30 hover:shadow-md"
             )}>
               {/* 背景装饰 - 光泽效果 */}
               <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-white/10 to-transparent pointer-events-none" />
+
+              {selectedFileData && selectedFileName && (
+                <div className="px-3 pt-3 pb-1">
+                  <div className="inline-flex max-w-full items-center gap-1.5 px-2 py-1 rounded-md bg-muted text-xs border border-border">
+                    <Paperclip className="w-3 h-3 flex-shrink-0" />
+                    <span className="max-w-[220px] sm:max-w-[320px] truncate" title={selectedFileName}>
+                      {selectedFileName}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={clearSelectedFile}
+                      className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                </div>
+              )}
+              {selectedAudioFile && (
+                <div className="px-3 pt-3 pb-1">
+                  <div className="inline-flex max-w-full items-center gap-1.5 px-2 py-1 rounded-md bg-muted text-xs border border-border">
+                    <Mic className="w-3 h-3 flex-shrink-0" />
+                    <span className="max-w-[220px] sm:max-w-[320px] truncate" title={selectedAudioName || selectedAudioFile.name}>
+                      {selectedAudioName || selectedAudioFile.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={resetSelectedAudio}
+                      className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                  {selectedAudioPreviewUrl && (
+                    <audio
+                      className="mt-2 w-full max-w-[360px]"
+                      controls
+                      preload="metadata"
+                      src={selectedAudioPreviewUrl}
+                    />
+                  )}
+                </div>
+              )}
+              {selectedVideoFile && (
+                <div className="px-3 pt-3 pb-1">
+                  <div className="inline-flex max-w-full items-center gap-1.5 px-2 py-1 rounded-md bg-muted text-xs border border-border">
+                    <Video className="w-3 h-3 flex-shrink-0" />
+                    <span className="max-w-[220px] sm:max-w-[320px] truncate" title={selectedVideoName || selectedVideoFile.name}>
+                      {selectedVideoName || selectedVideoFile.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={resetSelectedVideo}
+                      className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                  {selectedVideoPreviewUrl && (
+                    <video
+                      className="mt-2 w-full max-w-[420px] rounded-lg"
+                      controls
+                      preload="metadata"
+                      src={selectedVideoPreviewUrl}
+                    />
+                  )}
+                </div>
+              )}
 
               <textarea
                 ref={textareaRef}
@@ -937,10 +1556,9 @@ export function ChatBox({
                     : "后端服务未启动..."
                 }
                 className={cn(
-                  "flex-1 min-h-[52px] max-h-[200px] px-4 py-3.5 bg-transparent text-foreground placeholder:text-muted-foreground resize-none focus:outline-none text-sm leading-relaxed pr-14 rounded-2xl",
-                  selectedFileData && "pb-10"
+                  "flex-1 min-h-[52px] max-h-[200px] px-4 py-3.5 bg-transparent text-foreground placeholder:text-muted-foreground resize-none focus:outline-none text-sm leading-relaxed pr-14 rounded-2xl"
                 )}
-                disabled={isLoading || isSwitchingProfile || !isBackendAvailable}
+                disabled={isLoading || !isBackendAvailable}
                 rows={1}
                 style={{
                   height: "auto",
@@ -951,28 +1569,13 @@ export function ChatBox({
                   target.style.height = Math.min(target.scrollHeight, 200) + "px";
                 }}
               />
-              {selectedFileData && selectedFileName && (
-                <div className="absolute left-3 bottom-2.5 inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted text-xs border border-border">
-                  <Paperclip className="w-3 h-3" />
-                  <span className="max-w-[180px] truncate" title={selectedFileName}>
-                    {selectedFileName}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={clearSelectedFile}
-                    className="text-muted-foreground hover:text-foreground"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </div>
-              )}
               <Button
                 type="submit"
                 size="icon"
-                disabled={(!input.trim() && !selectedImageData && !selectedFileData) || isLoading || isSwitchingProfile || !isBackendAvailable}
+                disabled={(!input.trim() && selectedImages.length === 0 && !selectedFileData && !selectedAudioFile && !selectedVideoFile) || isLoading || !isBackendAvailable}
                 className={cn(
                   "absolute right-2 bottom-2 transition-all duration-300 h-10 w-10 rounded-xl",
-                  (input.trim() || selectedImageData || selectedFileData) && !isLoading && !isSwitchingProfile && isBackendAvailable
+                  (input.trim() || selectedImages.length > 0 || selectedFileData || selectedAudioFile || selectedVideoFile) && !isLoading && isBackendAvailable
                     ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:scale-105 shadow-lg shadow-primary/20"
                     : "bg-muted text-muted-foreground cursor-not-allowed hover:bg-muted"
                 )}
@@ -988,7 +1591,7 @@ export function ChatBox({
           <p className="text-[10px] text-muted-foreground/80 mt-2.5 text-center flex items-center justify-center gap-1.5">
             <span className="inline-flex items-center gap-1">
               <span className="w-1 h-1 rounded-full bg-primary/60 animate-pulse" />
-              支持文本/RAG/图片/文件，并可切换 Thinking 与 Tool Calling 模式
+              支持文本/RAG/图片/音频/视频/文件，Thinking 与 Tool Calling 由服务端档位控制
             </span>
           </p>
         </form>

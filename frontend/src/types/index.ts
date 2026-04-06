@@ -6,9 +6,19 @@ export interface ChatMessage {
   has_image?: boolean;
   image_data?: string;  // Base64 encoded image
   image_format?: string;  // Image format (png, jpeg, etc.)
+  image_id?: string;
+  image_ids?: string[];
+  image_url?: string;
+  image_urls?: string[];
   has_file?: boolean;
   file_name?: string;
   file_format?: string;
+  has_audio?: boolean;
+  audio_url?: string;
+  audio_urls?: string[];
+  has_video?: boolean;
+  video_url?: string;
+  video_urls?: string[];
   reasoning_content?: string;
   final_content?: string;
 }
@@ -29,6 +39,18 @@ export interface ChatResponse {
     message_count?: number;
     has_file?: boolean;
     has_image?: boolean;
+    has_audio?: boolean;
+    has_video?: boolean;
+    image_id?: string;
+    image_ids?: string[];
+    image_count?: number;
+    audio_url?: string;
+    audio_urls?: string[];
+    audio_count?: number;
+    audio_prefetched_count?: number;
+    video_url?: string;
+    video_urls?: string[];
+    video_count?: number;
     multimodal_mode?: string;
     deploy_profile?: string;
     requested_deploy_profile?: string;
@@ -48,6 +70,33 @@ export interface DocumentUploadResponse {
   filename: string;
   status: string;
   chunk_count: number;
+}
+
+export interface ChatImageUploadResponse {
+  image_id: string;
+  image_format: string;
+  size_bytes: number;
+  width: number;
+  height: number;
+  expires_in_seconds: number;
+}
+
+export interface ChatAudioUploadResponse {
+  audio_id: string;
+  audio_format: string;
+  media_type: string;
+  size_bytes: number;
+  file_name?: string;
+  expires_in_seconds: number;
+}
+
+export interface ChatVideoUploadResponse {
+  video_id: string;
+  video_format: string;
+  media_type: string;
+  size_bytes: number;
+  file_name?: string;
+  expires_in_seconds: number;
 }
 
 export interface DocumentBatchUploadResponse {
@@ -113,6 +162,8 @@ export interface ChatModeConfigResponse {
   provider: string;
   deploy_profile: string;
   supports_image: boolean;
+  supports_audio: boolean;
+  supports_video: boolean;
   supports_thinking: boolean;
   supports_tool_calling: boolean;
   available_profiles: string[];

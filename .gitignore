@@ -20,13 +20,17 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-.env
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Environment
+.env
+.env.local
+.env.*.local
 
 # Node.js / Frontend
 node_modules/
@@ -50,13 +54,24 @@ dist/
 backend/models/
 *.gguf
 *.bin
-*.gguf
 
-# 数据库
+# 数据库 / 运行时数据
 backend/data/chroma_db/
+backend/data/sessions.json
+backend/data/chat_audios/
+backend/data/chat_images/
+backend/data/chat_videos/
 *.sqlite
 *.sqlite3
 *.db
+
+# 测试结果
+vllm_test/results/
+vllm_test/**/*.jsonl
+
+# 部署配置（敏感）
+deploy/**/*.env
+deploy/*.sh
 
 # 日志
 *.log

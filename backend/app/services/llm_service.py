@@ -11,7 +11,7 @@ import operator
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Generator, AsyncGenerator
+from typing import Optional, Generator, AsyncGenerator, Any
 
 from app.core.config import settings, MODELS_DIR
 
@@ -214,24 +214,114 @@ def _build_data_url_image(image_data: str, image_format: str | None = None) -> s
     return f"data:image/{fmt};base64,{image_data}"
 
 
+def _collect_multimodal_images(
+    image_data: str | None = None,
+    image_format: str | None = None,
+    image_data_list: list[str] | None = None,
+    image_format_list: list[str | None] | None = None,
+) -> list[tuple[str, str | None]]:
+    """Collect single/multi image inputs into one normalized list."""
+    images: list[tuple[str, str | None]] = []
+    if image_data:
+        images.append((image_data, image_format))
+
+    formats = image_format_list or []
+    for idx, payload in enumerate(image_data_list or []):
+        if not payload:
+            continue
+        fmt = formats[idx] if idx < len(formats) else None
+        images.append((payload, fmt))
+    return images
+
+
+def _collect_multimodal_audio(
+    audio_url: str | None = None,
+    audio_url_list: list[str] | None = None,
+) -> list[str]:
+    """Collect single/multi audio URLs into one normalized list."""
+    audios: list[str] = []
+    if audio_url:
+        audios.append(audio_url)
+
+    for payload in audio_url_list or []:
+        if not payload:
+            continue
+        audios.append(payload)
+    return audios
+
+
+def _collect_multimodal_videos(
+    video_url: str | None = None,
+    video_url_list: list[str] | None = None,
+) -> list[str]:
+    """Collect single/multi video URLs into one normalized list."""
+    videos: list[str] = []
+    if video_url:
+        videos.append(video_url)
+
+    for payload in video_url_list or []:
+        if not payload:
+            continue
+        videos.append(payload)
+    return videos
+
+
 def _build_vllm_user_content(
     question: str,
     context: str = "",
     image_data: str | None = None,
     image_format: str | None = None,
+    image_data_list: list[str] | None = None,
+    image_format_list: list[str | None] | None = None,
+    audio_url: str | None = None,
+    audio_url_list: list[str] | None = None,
+    video_url: str | None = None,
+    video_url_list: list[str] | None = None,
 ):
     """Build user content payload for vLLM chat completion request."""
     user_text = _format_user_text(question, context)
-    if not image_data:
+    images = _collect_multimodal_images(
+        image_data=image_data,
+        image_format=image_format,
+        image_data_list=image_data_list,
+        image_format_list=image_format_list,
+    )
+    audios = _collect_multimodal_audio(
+        audio_url=audio_url,
+        audio_url_list=audio_url_list,
+    )
+    videos = _collect_multimodal_videos(
+        video_url=video_url,
+        video_url_list=video_url_list,
+    )
+    if not images and not audios and not videos:
         return user_text
 
-    return [
-        {"type": "text", "text": user_text},
-        {
-            "type": "image_url",
-            "image_url": {"url": _build_data_url_image(image_data, image_format)},
-        },
-    ]
+    # Keep official Gemma4 multimodal ordering: mm blocks first, text block last.
+    blocks: list[dict[str, object]] = []
+    for payload, fmt in images:
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": _build_data_url_image(payload, fmt)},
+            }
+        )
+    for video in videos:
+        blocks.append(
+            {
+                "type": "video_url",
+                "video_url": {"url": video},
+            }
+        )
+    for audio in audios:
+        blocks.append(
+            {
+                "type": "audio_url",
+                "audio_url": {"url": audio},
+            }
+        )
+    blocks.append({"type": "text", "text": user_text})
+    return blocks
 
 
 def _build_extra_body(enable_thinking: bool) -> dict | None:
@@ -243,6 +333,110 @@ def _build_extra_body(enable_thinking: bool) -> dict | None:
             "enable_thinking": True,
         }
     }
+
+
+def _get_value(obj: Any, key: str) -> Any:
+    """Read a field from dict/object safely."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _extract_text_field(value: Any) -> str:
+    """Extract text from OpenAI-compatible content field."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+                continue
+
+            item_text = _get_value(item, "text") or _get_value(item, "content")
+            if isinstance(item_text, str):
+                parts.append(item_text)
+        return "".join(parts)
+    return ""
+
+
+def _extract_reasoning_and_answer(message: Any) -> tuple[str, str]:
+    """Extract reasoning and final answer from non-stream message payload."""
+    answer = _extract_text_field(_get_value(message, "content")).strip()
+
+    reasoning = ""
+    for key in ("reasoning_content", "reasoning", "reasoning_text"):
+        candidate = _extract_text_field(_get_value(message, key)).strip()
+        if candidate:
+            reasoning = candidate
+            break
+
+    if not reasoning:
+        model_extra = _get_value(message, "model_extra")
+        if isinstance(model_extra, dict):
+            for key in ("reasoning_content", "reasoning", "reasoning_text"):
+                candidate = _extract_text_field(model_extra.get(key)).strip()
+                if candidate:
+                    reasoning = candidate
+                    break
+
+    return reasoning, answer
+
+
+def _format_thinking_output(reasoning: str, answer: str) -> str:
+    """Merge reasoning + answer into one text stream for downstream parser/UI."""
+    if reasoning and answer:
+        return f"thought {reasoning}\n\nFinal answer:\n{answer}"
+    if reasoning:
+        return f"thought {reasoning}"
+    return answer
+
+
+def _extract_delta_reasoning(delta: Any) -> str:
+    """Extract reasoning token chunk from streaming delta payload."""
+    for key in ("reasoning_content", "reasoning", "reasoning_text"):
+        token = _extract_text_field(_get_value(delta, key))
+        if token:
+            return token
+
+    model_extra = _get_value(delta, "model_extra")
+    if isinstance(model_extra, dict):
+        for key in ("reasoning_content", "reasoning", "reasoning_text"):
+            token = _extract_text_field(model_extra.get(key))
+            if token:
+                return token
+
+    return ""
+
+
+def _extract_delta_answer(delta: Any) -> str:
+    """Extract final answer token chunk from streaming delta payload."""
+    return _extract_text_field(_get_value(delta, "content"))
+
+
+def _resolve_generation_params(
+    max_tokens: int | None,
+    temperature: float | None,
+    top_p: float | None,
+) -> tuple[int, float, float]:
+    """Resolve request-level generation params with backend safety bounds."""
+    resolved_max_tokens = settings.MAX_TOKENS if max_tokens is None else int(max_tokens)
+    if resolved_max_tokens <= 0:
+        raise ValueError("max_tokens must be > 0")
+    resolved_max_tokens = min(resolved_max_tokens, settings.MAX_TOKENS_HARD_LIMIT)
+
+    resolved_temperature = settings.TEMPERATURE if temperature is None else float(temperature)
+    resolved_top_p = settings.TOP_P if top_p is None else float(top_p)
+    return resolved_max_tokens, resolved_temperature, resolved_top_p
 
 
 def _safe_eval_math(expression: str) -> float:
@@ -299,8 +493,17 @@ def _generate_vllm_with_modes(
     context: str,
     image_data: str | None,
     image_format: str | None,
+    image_data_list: list[str] | None,
+    image_format_list: list[str | None] | None,
+    audio_url: str | None,
+    audio_url_list: list[str] | None,
+    video_url: str | None,
+    video_url_list: list[str] | None,
     enable_thinking: bool,
     enable_tool_calling: bool,
+    max_tokens: int | None,
+    temperature: float | None,
+    top_p: float | None,
 ) -> str:
     """Generate response for vLLM mode combinations (text/multimodal/thinking/tools)."""
     client = get_openai_client()
@@ -309,11 +512,22 @@ def _generate_vllm_with_modes(
         context=context,
         image_data=image_data,
         image_format=image_format,
+        image_data_list=image_data_list,
+        image_format_list=image_format_list,
+        audio_url=audio_url,
+        audio_url_list=audio_url_list,
+        video_url=video_url,
+        video_url_list=video_url_list,
     )
     messages: list[dict] = [
         {"role": "system", "content": settings.SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
+    resolved_max_tokens, resolved_temperature, resolved_top_p = _resolve_generation_params(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
 
     extra_body = _build_extra_body(enable_thinking)
 
@@ -321,23 +535,26 @@ def _generate_vllm_with_modes(
         kwargs = {
             "model": settings.VLLM_MODEL,
             "messages": messages,
-            "temperature": settings.TEMPERATURE,
-            "top_p": settings.TOP_P,
-            "max_tokens": settings.MAX_TOKENS,
+            "temperature": resolved_temperature,
+            "top_p": resolved_top_p,
+            "max_tokens": resolved_max_tokens,
             "stream": False,
         }
         if extra_body:
             kwargs["extra_body"] = extra_body
         response = client.chat.completions.create(**kwargs)
-        return (response.choices[0].message.content or "").strip()
+        message = response.choices[0].message
+        reasoning, answer = _extract_reasoning_and_answer(message)
+        formatted = _format_thinking_output(reasoning, answer).strip()
+        return formatted
 
     first_kwargs = {
         "model": settings.VLLM_MODEL,
         "messages": messages,
         "tools": BUILTIN_TOOLS,
-        "temperature": settings.TEMPERATURE,
-        "top_p": settings.TOP_P,
-        "max_tokens": settings.MAX_TOKENS,
+        "temperature": resolved_temperature,
+        "top_p": resolved_top_p,
+        "max_tokens": resolved_max_tokens,
         "stream": False,
     }
     if extra_body:
@@ -347,7 +564,8 @@ def _generate_vllm_with_modes(
     tool_calls = first_message.tool_calls or []
 
     if not tool_calls:
-        return (first_message.content or "").strip()
+        reasoning, answer = _extract_reasoning_and_answer(first_message)
+        return _format_thinking_output(reasoning, answer).strip()
 
     assistant_tool_calls = []
     for call in tool_calls:
@@ -388,15 +606,17 @@ def _generate_vllm_with_modes(
         "model": settings.VLLM_MODEL,
         "messages": messages,
         "tools": BUILTIN_TOOLS,
-        "temperature": settings.TEMPERATURE,
-        "top_p": settings.TOP_P,
-        "max_tokens": settings.MAX_TOKENS,
+        "temperature": resolved_temperature,
+        "top_p": resolved_top_p,
+        "max_tokens": resolved_max_tokens,
         "stream": False,
     }
     if extra_body:
         second_kwargs["extra_body"] = extra_body
     second_response = client.chat.completions.create(**second_kwargs)
-    return (second_response.choices[0].message.content or "").strip()
+    second_message = second_response.choices[0].message
+    reasoning, answer = _extract_reasoning_and_answer(second_message)
+    return _format_thinking_output(reasoning, answer).strip()
 
 
 def format_prompt(question: str, context: str = "") -> str:
@@ -426,8 +646,17 @@ def generate_response(
     context: str = "",
     image_data: str | None = None,
     image_format: str | None = None,
+    image_data_list: list[str] | None = None,
+    image_format_list: list[str | None] | None = None,
+    audio_url: str | None = None,
+    audio_url_list: list[str] | None = None,
+    video_url: str | None = None,
+    video_url_list: list[str] | None = None,
     enable_thinking: bool = False,
     enable_tool_calling: bool = False,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> str:
     """Generate a non-streaming response.
 
@@ -444,18 +673,32 @@ def generate_response(
             context=context,
             image_data=image_data,
             image_format=image_format,
+            image_data_list=image_data_list,
+            image_format_list=image_format_list,
+            audio_url=audio_url,
+            audio_url_list=audio_url_list,
+            video_url=video_url,
+            video_url_list=video_url_list,
             enable_thinking=enable_thinking,
             enable_tool_calling=enable_tool_calling,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         )
 
     llm = get_llm()
     prompt = format_prompt(question, context)
+    resolved_max_tokens, resolved_temperature, resolved_top_p = _resolve_generation_params(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
 
     output = llm(
         prompt,
-        max_tokens=settings.MAX_TOKENS,
-        temperature=settings.TEMPERATURE,
-        top_p=settings.TOP_P,
+        max_tokens=resolved_max_tokens,
+        temperature=resolved_temperature,
+        top_p=resolved_top_p,
         top_k=settings.TOP_K,
         stop=get_stop_tokens(),
         echo=False,
@@ -472,8 +715,17 @@ def stream_response(
     context: str = "",
     image_data: str | None = None,
     image_format: str | None = None,
+    image_data_list: list[str] | None = None,
+    image_format_list: list[str | None] | None = None,
+    audio_url: str | None = None,
+    audio_url_list: list[str] | None = None,
+    video_url: str | None = None,
+    video_url_list: list[str] | None = None,
     enable_thinking: bool = False,
     enable_tool_calling: bool = False,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> Generator[str, None, None]:
     """Generate a streaming response.
 
@@ -485,14 +737,28 @@ def stream_response(
         Response tokens as they are generated
     """
     if settings.LLM_PROVIDER == "vllm":
+        resolved_max_tokens, resolved_temperature, resolved_top_p = _resolve_generation_params(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
         if enable_tool_calling:
             text = _generate_vllm_with_modes(
                 question=question,
                 context=context,
                 image_data=image_data,
                 image_format=image_format,
+                image_data_list=image_data_list,
+                image_format_list=image_format_list,
+                audio_url=audio_url,
+                audio_url_list=audio_url_list,
+                video_url=video_url,
+                video_url_list=video_url_list,
                 enable_thinking=enable_thinking,
                 enable_tool_calling=True,
+                max_tokens=resolved_max_tokens,
+                temperature=resolved_temperature,
+                top_p=resolved_top_p,
             )
             # Tool-calling path uses non-stream completion then chunk output.
             for idx in range(0, len(text), 12):
@@ -502,12 +768,14 @@ def stream_response(
             return
 
         logger.info(
-            "Dispatching vLLM stream request: model=%s has_image=%s thinking=%s tool_calling=%s image_chars=%d question_chars=%d context_chars=%d",
+            "Dispatching vLLM stream request: model=%s image_count=%d audio_count=%d video_count=%d thinking=%s tool_calling=%s image_chars=%d question_chars=%d context_chars=%d",
             settings.VLLM_MODEL,
-            bool(image_data),
+            len(_collect_multimodal_images(image_data, image_format, image_data_list, image_format_list)),
+            len(_collect_multimodal_audio(audio_url, audio_url_list)),
+            len(_collect_multimodal_videos(video_url, video_url_list)),
             enable_thinking,
             enable_tool_calling,
-            len(image_data or ""),
+            len(image_data or "") + sum(len(item or "") for item in (image_data_list or [])),
             len(question or ""),
             len(context or ""),
         )
@@ -517,6 +785,12 @@ def stream_response(
             context=context,
             image_data=image_data,
             image_format=image_format,
+            image_data_list=image_data_list,
+            image_format_list=image_format_list,
+            audio_url=audio_url,
+            audio_url_list=audio_url_list,
+            video_url=video_url,
+            video_url_list=video_url_list,
         )
         kwargs = {
             "model": settings.VLLM_MODEL,
@@ -524,32 +798,53 @@ def stream_response(
                 {"role": "system", "content": settings.SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            "temperature": settings.TEMPERATURE,
-            "top_p": settings.TOP_P,
-            "max_tokens": settings.MAX_TOKENS,
+            "temperature": resolved_temperature,
+            "top_p": resolved_top_p,
+            "max_tokens": resolved_max_tokens,
             "stream": True,
         }
         extra_body = _build_extra_body(enable_thinking)
         if extra_body:
             kwargs["extra_body"] = extra_body
         stream = client.chat.completions.create(**kwargs)
+        reasoning_started = False
+        answer_started = False
         for chunk in stream:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
-            token = delta.content if delta else None
-            if token:
-                yield token
+            if not delta:
+                continue
+
+            reasoning_token = _extract_delta_reasoning(delta)
+            answer_token = _extract_delta_answer(delta)
+
+            if reasoning_token:
+                if not reasoning_started:
+                    reasoning_started = True
+                    yield "thought "
+                yield reasoning_token
+
+            if answer_token:
+                if reasoning_started and not answer_started:
+                    answer_started = True
+                    yield "\n\nFinal answer:\n"
+                yield answer_token
         return
 
     llm = get_llm()
     prompt = format_prompt(question, context)
+    resolved_max_tokens, resolved_temperature, resolved_top_p = _resolve_generation_params(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
 
     for chunk in llm(
         prompt,
-        max_tokens=settings.MAX_TOKENS,
-        temperature=settings.TEMPERATURE,
-        top_p=settings.TOP_P,
+        max_tokens=resolved_max_tokens,
+        temperature=resolved_temperature,
+        top_p=resolved_top_p,
         top_k=settings.TOP_K,
         stop=get_stop_tokens(),
         echo=False,
@@ -567,8 +862,17 @@ async def astream_response(
     context: str = "",
     image_data: str | None = None,
     image_format: str | None = None,
+    image_data_list: list[str] | None = None,
+    image_format_list: list[str | None] | None = None,
+    audio_url: str | None = None,
+    audio_url_list: list[str] | None = None,
+    video_url: str | None = None,
+    video_url_list: list[str] | None = None,
     enable_thinking: bool = False,
     enable_tool_calling: bool = False,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> AsyncGenerator[str, None]:
     """Async version of streaming response.
 
@@ -591,8 +895,17 @@ async def astream_response(
                 context=context,
                 image_data=image_data,
                 image_format=image_format,
+                image_data_list=image_data_list,
+                image_format_list=image_format_list,
+                audio_url=audio_url,
+                audio_url_list=audio_url_list,
+                video_url=video_url,
+                video_url_list=video_url_list,
                 enable_thinking=enable_thinking,
                 enable_tool_calling=enable_tool_calling,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
             ):
                 loop.call_soon_threadsafe(queue.put_nowait, token)
         except Exception as exc:

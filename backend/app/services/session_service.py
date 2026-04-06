@@ -39,9 +39,17 @@ def _load_sessions():
                         has_image=msg.get("has_image", False),
                         image_data=msg.get("image_data"),
                         image_format=msg.get("image_format"),
+                        image_id=msg.get("image_id"),
+                        image_ids=msg.get("image_ids"),
                         has_file=msg.get("has_file", False),
                         file_name=msg.get("file_name"),
                         file_format=msg.get("file_format"),
+                        has_audio=msg.get("has_audio", False),
+                        audio_url=msg.get("audio_url"),
+                        audio_urls=msg.get("audio_urls"),
+                        has_video=msg.get("has_video", False),
+                        video_url=msg.get("video_url"),
+                        video_urls=msg.get("video_urls"),
                         reasoning_content=msg.get("reasoning_content"),
                         final_content=msg.get("final_content"),
                     )
@@ -73,9 +81,17 @@ def _save_sessions():
                 "has_image": msg.has_image if hasattr(msg, "has_image") else False,
                 "image_data": msg.image_data if hasattr(msg, "image_data") else None,
                 "image_format": msg.image_format if hasattr(msg, "image_format") else None,
+                "image_id": msg.image_id if hasattr(msg, "image_id") else None,
+                "image_ids": msg.image_ids if hasattr(msg, "image_ids") else None,
                 "has_file": msg.has_file if hasattr(msg, "has_file") else False,
                 "file_name": msg.file_name if hasattr(msg, "file_name") else None,
                 "file_format": msg.file_format if hasattr(msg, "file_format") else None,
+                "has_audio": msg.has_audio if hasattr(msg, "has_audio") else False,
+                "audio_url": msg.audio_url if hasattr(msg, "audio_url") else None,
+                "audio_urls": msg.audio_urls if hasattr(msg, "audio_urls") else None,
+                "has_video": msg.has_video if hasattr(msg, "has_video") else False,
+                "video_url": msg.video_url if hasattr(msg, "video_url") else None,
+                "video_urls": msg.video_urls if hasattr(msg, "video_urls") else None,
                 "reasoning_content": msg.reasoning_content if hasattr(msg, "reasoning_content") else None,
                 "final_content": msg.final_content if hasattr(msg, "final_content") else None,
             }
@@ -121,9 +137,17 @@ def add_message(
     has_image: bool = False,
     image_data: str = None,
     image_format: str = None,
+    image_id: str = None,
+    image_ids: list[str] | None = None,
     has_file: bool = False,
     file_name: str = None,
     file_format: str = None,
+    has_audio: bool = False,
+    audio_url: str = None,
+    audio_urls: list[str] | None = None,
+    has_video: bool = False,
+    video_url: str = None,
+    video_urls: list[str] | None = None,
     reasoning_content: str = None,
     final_content: str = None,
 ) -> ChatMessage:
@@ -136,9 +160,17 @@ def add_message(
         has_image: Whether the message has an attached image
         image_data: Base64 encoded image data
         image_format: Image format (png, jpeg, etc.)
+        image_id: Cached image ID for image retrieval
+        image_ids: Cached image IDs for multi-image retrieval
         has_file: Whether the message has an attached file
         file_name: Uploaded file name
         file_format: Uploaded file format/extension
+        has_audio: Whether the message has an attached audio
+        audio_url: Audio URL for multimodal request
+        audio_urls: Audio URL list for multimodal request
+        has_video: Whether the message has an attached video
+        video_url: Video URL for multimodal request
+        video_urls: Video URL list for multimodal request
         reasoning_content: Structured reasoning content for assistant message
         final_content: Structured final answer content for assistant message
 
@@ -156,9 +188,17 @@ def add_message(
         has_image=has_image,
         image_data=image_data,
         image_format=image_format,
+        image_id=image_id,
+        image_ids=image_ids,
         has_file=has_file,
         file_name=file_name,
         file_format=file_format,
+        has_audio=has_audio,
+        audio_url=audio_url,
+        audio_urls=audio_urls,
+        has_video=has_video,
+        video_url=video_url,
+        video_urls=video_urls,
         reasoning_content=reasoning_content,
         final_content=final_content,
     )
@@ -257,9 +297,17 @@ def get_session_info(session_id: str) -> Optional[Dict]:
                 "has_image": msg.has_image if hasattr(msg, "has_image") else False,
                 "image_data": msg.image_data if hasattr(msg, "image_data") else None,
                 "image_format": msg.image_format if hasattr(msg, "image_format") else None,
+                "image_id": msg.image_id if hasattr(msg, "image_id") else None,
+                "image_ids": msg.image_ids if hasattr(msg, "image_ids") else None,
                 "has_file": msg.has_file if hasattr(msg, "has_file") else False,
                 "file_name": msg.file_name if hasattr(msg, "file_name") else None,
                 "file_format": msg.file_format if hasattr(msg, "file_format") else None,
+                "has_audio": msg.has_audio if hasattr(msg, "has_audio") else False,
+                "audio_url": msg.audio_url if hasattr(msg, "audio_url") else None,
+                "audio_urls": msg.audio_urls if hasattr(msg, "audio_urls") else None,
+                "has_video": msg.has_video if hasattr(msg, "has_video") else False,
+                "video_url": msg.video_url if hasattr(msg, "video_url") else None,
+                "video_urls": msg.video_urls if hasattr(msg, "video_urls") else None,
                 "reasoning_content": msg.reasoning_content if hasattr(msg, "reasoning_content") else None,
                 "final_content": msg.final_content if hasattr(msg, "final_content") else None,
             }

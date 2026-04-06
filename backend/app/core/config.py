@@ -22,7 +22,12 @@ class Settings(BaseSettings):
     VERSION: str = "0.1.0"
 
     # CORS
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ]
 
     # LLM Settings (Qwen2.5-7B GGUF - much smarter model)
     LLM_PROVIDER: str = "llama_cpp"  # llama_cpp | vllm
@@ -31,7 +36,8 @@ class Settings(BaseSettings):
     N_CTX: int = 4096  # Context window size
     F16_KV: bool = True  # Use half-precision for KV cache
     TEMPERATURE: float = 0.7
-    MAX_TOKENS: int = 512
+    MAX_TOKENS: int = 8192
+    MAX_TOKENS_HARD_LIMIT: int = 16384  # Upper bound for per-request max_tokens override
     TOP_P: float = 0.95
     TOP_K: int = 40
 
@@ -42,20 +48,48 @@ class Settings(BaseSettings):
     VLLM_BASE_URL: str = "http://127.0.0.1:8100/v1"
     VLLM_API_KEY: str = "EMPTY"
     VLLM_MODEL: str = "gemma4-e4b-it"
-    VLLM_DEPLOY_PROFILE: str = "rag_text"  # rag_text | vision | full | benchmark
-    VLLM_TIMEOUT_SECONDS: float = 60.0
-    VLLM_PROBE_TIMEOUT_SECONDS: float = 4.0
-    VLLM_HEALTH_CACHE_SECONDS: float = 15.0
+    VLLM_DEPLOY_PROFILE: str = "full_featured"  # rag_text | vision | full | full_featured | benchmark | extreme
+    VLLM_TIMEOUT_SECONDS: float = 600.0
+    VLLM_PROBE_TIMEOUT_SECONDS: float = 8.0
+    VLLM_HEALTH_CACHE_SECONDS: float = 5.0
 
     # Multimodal safety guard (base64 chars, without data URL prefix)
-    MAX_IMAGE_BASE64_CHARS: int = 4_000_000
-    MAX_CHAT_FILE_BASE64_CHARS: int = 8_000_000
-    MAX_CHAT_FILE_CONTEXT_CHARS: int = 12_000
+    MAX_IMAGE_BASE64_CHARS: int = 50_000_000
+    MAX_SESSION_IMAGE_BASE64_CHARS: int = 5_000_000
+    MAX_CHAT_FILE_BASE64_CHARS: int = 80_000_000
+    MAX_CHAT_FILE_CONTEXT_CHARS: int = 500_000
     CHAT_FILE_ALLOWED_EXTENSIONS: str = ".txt,.md,.markdown,.pdf,.csv,.json,.log"
+    MAX_CHAT_IMAGE_UPLOAD_MB: int = 64
+    CHAT_IMAGE_CACHE_DIR: str = "./data/chat_images"
+    CHAT_IMAGE_CACHE_TTL_SECONDS: int = 604_800
+    CHAT_IMAGE_CACHE_MAX_FILES: int = 20_000
+    CHAT_IMAGE_TARGET_MAX_EDGE: int = 4096
+    CHAT_IMAGE_TARGET_MAX_BYTES: int = 8_000_000
+    CHAT_IMAGE_TARGET_QUALITY: int = 95
+    MAX_CHAT_AUDIO_UPLOAD_MB: int = 32
+    CHAT_AUDIO_CACHE_DIR: str = "./data/chat_audios"
+    CHAT_AUDIO_CACHE_TTL_SECONDS: int = 604_800
+    CHAT_AUDIO_CACHE_MAX_FILES: int = 20_000
+    CHAT_AUDIO_ALLOWED_EXTENSIONS: str = ".wav,.mp3,.ogg,.webm,.m4a,.mp4,.flac"
+    ALLOW_PUBLIC_AUDIO_URLS: bool = False
+    AUDIO_FETCH_TIMEOUT_SECONDS: float = 20.0
+    MAX_AUDIO_FETCH_BYTES: int = 25_000_000
+    MAX_CHAT_VIDEO_UPLOAD_MB: int = 256
+    CHAT_VIDEO_CACHE_DIR: str = "./data/chat_videos"
+    CHAT_VIDEO_CACHE_TTL_SECONDS: int = 604_800
+    CHAT_VIDEO_CACHE_MAX_FILES: int = 10_000
+    CHAT_VIDEO_ALLOWED_EXTENSIONS: str = ".mp4,.mov,.webm,.mkv,.m4v,.avi"
+    ALLOW_PUBLIC_VIDEO_URLS: bool = False
+    # Must be reachable by the vLLM server when backend passes local /api/chat/videos/{video_id}.
+    LOCAL_MEDIA_BASE_URL: str = "http://127.0.0.1:8000"
+    # Preferred transport for local uploaded video when sending to vLLM.
+    # data_url: avoid vLLM reverse-fetch dependency; url: let vLLM pull by URL.
+    LOCAL_VIDEO_TRANSPORT_MODE: str = "data_url"  # data_url | url
+    MAX_VIDEO_DATA_URL_BYTES: int = 50_000_000
 
     # Document upload limits
-    MAX_UPLOAD_FILE_SIZE_MB: int = 20
-    MAX_BATCH_UPLOAD_FILES: int = 10
+    MAX_UPLOAD_FILE_SIZE_MB: int = 200
+    MAX_BATCH_UPLOAD_FILES: int = 100
     UPLOAD_ALLOWED_EXTENSIONS: str = ".txt,.md,.markdown,.html,.htm,.pdf"
 
     # Embedding Settings (GTE-large with MPS)
@@ -125,8 +159,15 @@ class Settings(BaseSettings):
                 raise ValueError("VLLM_API_KEY is required when LLM_PROVIDER=vllm")
             if not self.VLLM_BASE_URL.startswith(("http://", "https://")):
                 raise ValueError("VLLM_BASE_URL must start with http:// or https://")
-            if self.VLLM_DEPLOY_PROFILE not in {"rag_text", "vision", "full", "benchmark"}:
-                raise ValueError("VLLM_DEPLOY_PROFILE must be one of: rag_text, vision, full, benchmark")
+            if self.VLLM_DEPLOY_PROFILE not in {"rag_text", "vision", "full", "full_featured", "benchmark", "extreme"}:
+                raise ValueError(
+                    "VLLM_DEPLOY_PROFILE must be one of: rag_text, vision, full, full_featured, benchmark, extreme"
+                )
+
+        if self.MAX_TOKENS <= 0:
+            raise ValueError("MAX_TOKENS must be > 0")
+        if self.MAX_TOKENS_HARD_LIMIT < self.MAX_TOKENS:
+            raise ValueError("MAX_TOKENS_HARD_LIMIT must be >= MAX_TOKENS")
 
         if self.MAX_UPLOAD_FILE_SIZE_MB <= 0:
             raise ValueError("MAX_UPLOAD_FILE_SIZE_MB must be > 0")
@@ -134,8 +175,44 @@ class Settings(BaseSettings):
             raise ValueError("MAX_BATCH_UPLOAD_FILES must be > 0")
         if self.MAX_CHAT_FILE_BASE64_CHARS <= 0:
             raise ValueError("MAX_CHAT_FILE_BASE64_CHARS must be > 0")
+        if self.MAX_SESSION_IMAGE_BASE64_CHARS <= 0:
+            raise ValueError("MAX_SESSION_IMAGE_BASE64_CHARS must be > 0")
         if self.MAX_CHAT_FILE_CONTEXT_CHARS <= 0:
             raise ValueError("MAX_CHAT_FILE_CONTEXT_CHARS must be > 0")
+        if self.MAX_CHAT_IMAGE_UPLOAD_MB <= 0:
+            raise ValueError("MAX_CHAT_IMAGE_UPLOAD_MB must be > 0")
+        if self.CHAT_IMAGE_CACHE_TTL_SECONDS <= 0:
+            raise ValueError("CHAT_IMAGE_CACHE_TTL_SECONDS must be > 0")
+        if self.CHAT_IMAGE_CACHE_MAX_FILES <= 0:
+            raise ValueError("CHAT_IMAGE_CACHE_MAX_FILES must be > 0")
+        if self.CHAT_IMAGE_TARGET_MAX_EDGE <= 0:
+            raise ValueError("CHAT_IMAGE_TARGET_MAX_EDGE must be > 0")
+        if self.CHAT_IMAGE_TARGET_MAX_BYTES <= 0:
+            raise ValueError("CHAT_IMAGE_TARGET_MAX_BYTES must be > 0")
+        if self.CHAT_IMAGE_TARGET_QUALITY <= 0 or self.CHAT_IMAGE_TARGET_QUALITY > 95:
+            raise ValueError("CHAT_IMAGE_TARGET_QUALITY must be in (0, 95]")
+        if self.MAX_CHAT_AUDIO_UPLOAD_MB <= 0:
+            raise ValueError("MAX_CHAT_AUDIO_UPLOAD_MB must be > 0")
+        if self.CHAT_AUDIO_CACHE_TTL_SECONDS <= 0:
+            raise ValueError("CHAT_AUDIO_CACHE_TTL_SECONDS must be > 0")
+        if self.CHAT_AUDIO_CACHE_MAX_FILES <= 0:
+            raise ValueError("CHAT_AUDIO_CACHE_MAX_FILES must be > 0")
+        if self.AUDIO_FETCH_TIMEOUT_SECONDS <= 0:
+            raise ValueError("AUDIO_FETCH_TIMEOUT_SECONDS must be > 0")
+        if self.MAX_AUDIO_FETCH_BYTES <= 0:
+            raise ValueError("MAX_AUDIO_FETCH_BYTES must be > 0")
+        if self.MAX_CHAT_VIDEO_UPLOAD_MB <= 0:
+            raise ValueError("MAX_CHAT_VIDEO_UPLOAD_MB must be > 0")
+        if self.CHAT_VIDEO_CACHE_TTL_SECONDS <= 0:
+            raise ValueError("CHAT_VIDEO_CACHE_TTL_SECONDS must be > 0")
+        if self.CHAT_VIDEO_CACHE_MAX_FILES <= 0:
+            raise ValueError("CHAT_VIDEO_CACHE_MAX_FILES must be > 0")
+        if not self.LOCAL_MEDIA_BASE_URL.startswith(("http://", "https://")):
+            raise ValueError("LOCAL_MEDIA_BASE_URL must start with http:// or https://")
+        if self.LOCAL_VIDEO_TRANSPORT_MODE not in {"data_url", "url"}:
+            raise ValueError("LOCAL_VIDEO_TRANSPORT_MODE must be 'data_url' or 'url'")
+        if self.MAX_VIDEO_DATA_URL_BYTES <= 0:
+            raise ValueError("MAX_VIDEO_DATA_URL_BYTES must be > 0")
         if self.VISION_BACKEND not in {"glm", "local"}:
             raise ValueError("VISION_BACKEND must be 'glm' or 'local'")
 

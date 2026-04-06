@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
 
         # Initialize vision model for multimodal support (legacy proxy path)
         if settings.LLM_PROVIDER == "vllm":
-            print("  vLLM provider active: Gemma4 native multimodal will be used for image chat")
+            print("  vLLM provider active: Gemma4 native multimodal will be used for image/audio/video chat")
             if settings.DISABLE_GLM_VISION:
                 print("  ✓ GLM vision proxy disabled by config")
             else:
@@ -109,6 +109,12 @@ async def root():
         "endpoints": {
             "chat": f"{settings.API_V1_PREFIX}/chat/",
             "stream": f"{settings.API_V1_PREFIX}/chat/stream",
+            "chat_image_upload": f"{settings.API_V1_PREFIX}/chat/images/upload",
+            "chat_image_get": f"{settings.API_V1_PREFIX}/chat/images/{{image_id}}",
+            "chat_audio_upload": f"{settings.API_V1_PREFIX}/chat/audios/upload",
+            "chat_audio_get": f"{settings.API_V1_PREFIX}/chat/audios/{{audio_id}}",
+            "chat_video_upload": f"{settings.API_V1_PREFIX}/chat/videos/upload",
+            "chat_video_get": f"{settings.API_V1_PREFIX}/chat/videos/{{video_id}}",
             "chat_mode_config": f"{settings.API_V1_PREFIX}/chat/mode-config",
             "upload": f"{settings.API_V1_PREFIX}/documents/upload",
             "upload_batch": f"{settings.API_V1_PREFIX}/documents/upload-batch",

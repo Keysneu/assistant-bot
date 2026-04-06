@@ -1,5 +1,0 @@
-[Recommendation]
-recommended_max_concurrency=1
-rule=success_rate>=99.0% and p95<=8.0s
-raw_table=./vllm_test/results/sweep_20260328_204826/table.tsv
-report=./vllm_test/results/sweep_20260328_204826/report.txt

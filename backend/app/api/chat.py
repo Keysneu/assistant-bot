@@ -1,18 +1,21 @@
 """Chat API endpoints.
 
 Handles streaming and non-streaming chat responses with RAG support.
-Multimodal support for image understanding using BLIP-2 vision model.
+Supports Gemma4 native multimodal input (image/audio/video) on vLLM.
 """
 import base64
 import json
 import re
 import logging
-from threading import Lock
+import mimetypes
 from io import BytesIO
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from urllib.parse import urlparse
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 from pypdf import PdfReader
+import httpx
 
 from app.core.config import settings
 from app.models.schema import (
@@ -21,7 +24,9 @@ from app.models.schema import (
     ErrorResponse,
     SessionTitleRequest,
     ChatModeConfigResponse,
-    ChatModeUpdateRequest,
+    ChatImageUploadResponse,
+    ChatAudioUploadResponse,
+    ChatVideoUploadResponse,
 )
 from app.services.llm_service import (
     generate_response,
@@ -45,6 +50,24 @@ from app.services.vision_service import (
     analyze_image_content,
     is_vision_available,
 )
+from app.services.chat_image_service import (
+    persist_uploaded_chat_image,
+    get_chat_image_file,
+    resolve_chat_image_payload,
+    persist_chat_image_from_base64,
+)
+from app.services.chat_audio_service import (
+    persist_uploaded_chat_audio,
+    get_chat_audio_file,
+    resolve_chat_audio_id_from_url,
+    resolve_chat_audio_data_url,
+)
+from app.services.chat_video_service import (
+    persist_uploaded_chat_video,
+    get_chat_video_file,
+    resolve_chat_video_id_from_url,
+    resolve_chat_video_data_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,29 +76,47 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
     "rag_text": {
         "supports_image": False,
+        "supports_audio": False,
+        "supports_video": False,
         "supports_thinking": True,
         "supports_tool_calling": False,
     },
     "vision": {
         "supports_image": True,
+        "supports_audio": False,
+        "supports_video": False,
         "supports_thinking": True,
         "supports_tool_calling": False,
     },
     "full": {
         "supports_image": True,
+        "supports_audio": True,
+        "supports_video": True,
+        "supports_thinking": True,
+        "supports_tool_calling": True,
+    },
+    "full_featured": {
+        "supports_image": True,
+        "supports_audio": True,
+        "supports_video": True,
         "supports_thinking": True,
         "supports_tool_calling": True,
     },
     "benchmark": {
         "supports_image": False,
+        "supports_audio": False,
+        "supports_video": False,
+        "supports_thinking": False,
+        "supports_tool_calling": False,
+    },
+    "extreme": {
+        "supports_image": False,
+        "supports_audio": False,
+        "supports_video": False,
         "supports_thinking": False,
         "supports_tool_calling": False,
     },
 }
-
-_RUNTIME_PROFILE_OVERRIDE: str | None = None
-_RUNTIME_PROFILE_LOCK = Lock()
-
 
 def _normalize_profile(profile: str | None) -> str | None:
     """Normalize profile key and validate against supported profile map."""
@@ -89,37 +130,25 @@ def _normalize_profile(profile: str | None) -> str | None:
     return normalized
 
 
-def _get_runtime_profile_override() -> str | None:
-    """Get runtime profile override set via API."""
-    with _RUNTIME_PROFILE_LOCK:
-        return _RUNTIME_PROFILE_OVERRIDE
+def _resolve_effective_profile(request_profile: str | None = None) -> tuple[str, str, list[str]]:
+    """Resolve effective profile and source for this request.
 
-
-def _set_runtime_profile_override(profile: str | None) -> None:
-    """Set runtime profile override from API/UI."""
-    global _RUNTIME_PROFILE_OVERRIDE
-    with _RUNTIME_PROFILE_LOCK:
-        _RUNTIME_PROFILE_OVERRIDE = profile
-
-
-def _resolve_effective_profile(request_profile: str | None = None) -> tuple[str, str]:
-    """Resolve effective profile and source for this request."""
+    Runtime/request profile switching is intentionally disabled.
+    Effective profile is locked to backend env setting.
+    """
     if settings.LLM_PROVIDER != "vllm":
-        return "local_default", "local_default"
-
-    normalized_request = _normalize_profile(request_profile)
-    if normalized_request:
-        return normalized_request, "request_override"
-
-    runtime_override = _normalize_profile(_get_runtime_profile_override())
-    if runtime_override:
-        return runtime_override, "runtime_override"
+        return "local_default", "local_default", []
 
     env_profile = _normalize_profile(settings.VLLM_DEPLOY_PROFILE)
     if env_profile:
-        return env_profile, "env_default"
+        warnings: list[str] = []
+        if request_profile:
+            warnings.append(
+                f"Requested profile '{request_profile}' ignored; server is locked to '{env_profile}'"
+            )
+        return env_profile, "env_locked", warnings
 
-    return "rag_text", "fallback_default"
+    return "full_featured", "fallback_full_featured", []
 
 
 def _current_mode_config(request_profile: str | None = None) -> dict[str, object]:
@@ -129,6 +158,8 @@ def _current_mode_config(request_profile: str | None = None) -> dict[str, object
             "provider": settings.LLM_PROVIDER,
             "deploy_profile": "local_default",
             "supports_image": True,
+            "supports_audio": False,
+            "supports_video": False,
             "supports_thinking": False,
             "supports_tool_calling": False,
             "available_profiles": [],
@@ -137,15 +168,15 @@ def _current_mode_config(request_profile: str | None = None) -> dict[str, object
             "profile_source": "local_default",
         }
 
-    effective_profile, profile_source = _resolve_effective_profile(request_profile)
+    effective_profile, profile_source, _ = _resolve_effective_profile(request_profile)
     caps = VLLM_PROFILE_CAPABILITIES[effective_profile]
     return {
         "provider": settings.LLM_PROVIDER,
         "deploy_profile": effective_profile,
         **caps,
-        "available_profiles": list(VLLM_PROFILE_CAPABILITIES.keys()),
+        "available_profiles": [],
         "configured_profile": settings.VLLM_DEPLOY_PROFILE,
-        "runtime_profile_override": _get_runtime_profile_override(),
+        "runtime_profile_override": None,
         "profile_source": profile_source,
     }
 
@@ -156,11 +187,8 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
     supports_thinking = bool(mode_config.get("supports_thinking", False))
     supports_tool_calling = bool(mode_config.get("supports_tool_calling", False))
 
-    warnings: list[str] = []
-    if request.deploy_profile and str(mode_config.get("profile_source")) != "request_override":
-        warnings.append(
-            f"Requested profile '{request.deploy_profile}' is invalid; fallback to '{mode_config['deploy_profile']}'"
-        )
+    _, _, profile_warnings = _resolve_effective_profile(request.deploy_profile)
+    warnings: list[str] = [str(item) for item in profile_warnings if str(item).strip()]
 
     effective_thinking = bool(request.enable_thinking and supports_thinking)
     effective_tool_calling = bool(request.enable_tool_calling and supports_tool_calling)
@@ -174,16 +202,71 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
             f"Tool calling requested but disabled by deploy profile '{mode_config['deploy_profile']}'"
         )
 
-    if request.image and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_image", False)):
+    has_image_input = bool(
+        (request.image and request.image.strip())
+        or (request.image_id and request.image_id.strip())
+        or (request.images and any(item and item.strip() for item in request.images))
+        or (request.image_ids and any(item and item.strip() for item in request.image_ids))
+    )
+    has_audio_input = bool(
+        (request.audio_url and request.audio_url.strip())
+        or (request.audio_urls and any(item and item.strip() for item in request.audio_urls))
+    )
+    has_video_input = bool(
+        (request.video_url and request.video_url.strip())
+        or (request.video_urls and any(item and item.strip() for item in request.video_urls))
+    )
+    if has_image_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_image", False)):
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Current deploy profile '{mode_config['deploy_profile']}' does not support image mode. "
-                "Please switch runtime profile to 'vision' or 'full'."
+                "Please use a server startup profile that supports images (recommended: full_featured)."
+            ),
+        )
+    if has_audio_input and settings.LLM_PROVIDER != "vllm":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Audio input currently requires LLM_PROVIDER=vllm. "
+                "Please switch to vLLM (Gemma4 E2B/E4B with audio support)."
+            ),
+        )
+    if has_audio_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_audio", False)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Current deploy profile '{mode_config['deploy_profile']}' does not support audio mode. "
+                "Please use a server startup profile that supports audio (recommended: full/full_featured)."
+            ),
+        )
+    if has_video_input and settings.LLM_PROVIDER != "vllm":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Video input currently requires LLM_PROVIDER=vllm. "
+                "Please switch to vLLM (Gemma4 E2B/E4B with video support)."
+            ),
+        )
+    if has_video_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_video", False)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Current deploy profile '{mode_config['deploy_profile']}' does not support video mode. "
+                "Please use a server startup profile that supports videos (recommended: full/full_featured)."
             ),
         )
 
     return effective_thinking, effective_tool_calling, warnings, mode_config
+
+
+def _resolve_generation_overrides(request: ChatRequest) -> tuple[int, float, float]:
+    """Resolve effective generation params for metadata/debug visibility."""
+    effective_max_tokens = request.max_tokens if request.max_tokens is not None else settings.MAX_TOKENS
+    effective_max_tokens = max(1, min(int(effective_max_tokens), settings.MAX_TOKENS_HARD_LIMIT))
+    effective_temperature = settings.TEMPERATURE if request.temperature is None else float(request.temperature)
+    effective_top_p = settings.TOP_P if request.top_p is None else float(request.top_p)
+    return effective_max_tokens, effective_temperature, effective_top_p
 
 
 def _extract_base64_payload(image_data: str) -> str:
@@ -258,6 +341,263 @@ def _enforce_image_payload_limit(image_data: str | None) -> None:
                 f"Limit is {limit_mb:.2f}MB. Please upload a smaller image."
             ),
         )
+
+
+def _normalize_str_list(values: list[str] | None, lower: bool = False) -> list[str]:
+    """Normalize optional string list by trimming empties."""
+    normalized: list[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        normalized.append(text.lower() if lower else text)
+    return normalized
+
+
+def _resolve_image_inputs(request: ChatRequest) -> tuple[list[str], list[str | None], list[str]]:
+    """Resolve single/multi image inputs into normalized payloads + formats + cached IDs."""
+    payloads: list[str] = []
+    formats: list[str | None] = []
+    cached_ids: list[str] = []
+
+    inline_payloads, inline_formats = _resolve_inline_image_inputs(request)
+    payloads.extend(inline_payloads)
+    formats.extend(inline_formats)
+
+    if request.image_id:
+        payload, payload_format = resolve_chat_image_payload(image_data=None, image_id=request.image_id)
+        _enforce_image_payload_limit(payload)
+        payloads.append(payload or "")
+        formats.append(payload_format or request.image_format or "jpeg")
+        cached_ids.append(request.image_id.strip().lower())
+
+    for image_id in _normalize_str_list(request.image_ids, lower=True):
+        payload, payload_format = resolve_chat_image_payload(image_data=None, image_id=image_id)
+        _enforce_image_payload_limit(payload)
+        payloads.append(payload or "")
+        formats.append(payload_format or "jpeg")
+        cached_ids.append(image_id)
+
+    return payloads, formats, cached_ids
+
+
+def _validate_audio_url(audio_url: str) -> str:
+    """Validate supported audio URL formats for Gemma4 multimodal input."""
+    normalized = audio_url.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="audio_url cannot be empty")
+
+    if normalized.startswith("data:audio/"):
+        return normalized
+
+    local_audio_id = resolve_chat_audio_id_from_url(normalized)
+    if local_audio_id:
+        return normalized
+
+    parsed = urlparse(normalized)
+    if settings.ALLOW_PUBLIC_AUDIO_URLS and parsed.scheme in {"http", "https"} and parsed.netloc:
+        return normalized
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "audio_url only supports local uploaded audio URLs "
+            "('/api/chat/audios/{audio_id}' or full URL with same path) "
+            "or data:audio/* data URL. Public internet audio URLs are disabled."
+        ),
+    )
+
+
+def _resolve_audio_inputs(request: ChatRequest) -> list[str]:
+    """Resolve single/multi audio URL inputs into a normalized list."""
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw in [request.audio_url, *(request.audio_urls or [])]:
+        if not raw:
+            continue
+        normalized = _validate_audio_url(str(raw))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(normalized)
+    return resolved
+
+
+def _is_data_audio_url(audio_url: str) -> bool:
+    """Check whether URL is already an inline audio data URL."""
+    return audio_url.startswith("data:audio/")
+
+
+def _infer_audio_mime_type(audio_url: str, content_type: str | None) -> str:
+    """Infer best-effort audio MIME type from response header or URL suffix."""
+    candidate = (content_type or "").split(";", 1)[0].strip().lower()
+    if candidate.startswith("audio/"):
+        return candidate
+
+    path = urlparse(audio_url).path
+    guessed, _ = mimetypes.guess_type(path)
+    if guessed and guessed.startswith("audio/"):
+        return guessed
+
+    return "audio/wav"
+
+
+async def _fetch_audio_url_as_data_url(audio_url: str) -> str:
+    """Resolve audio URL to data URL for vLLM audio blocks."""
+    if _is_data_audio_url(audio_url):
+        return audio_url
+
+    local_audio_id = resolve_chat_audio_id_from_url(audio_url)
+    if local_audio_id:
+        return resolve_chat_audio_data_url(local_audio_id)
+
+    parsed = urlparse(audio_url)
+    if parsed.scheme not in {"http", "https"}:
+        return audio_url
+
+    timeout = httpx.Timeout(
+        timeout=settings.AUDIO_FETCH_TIMEOUT_SECONDS,
+        connect=min(10.0, settings.AUDIO_FETCH_TIMEOUT_SECONDS),
+    )
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False) as client:
+            response = await client.get(audio_url)
+            response.raise_for_status()
+            audio_bytes = response.content
+            if not audio_bytes:
+                raise ValueError("empty audio payload")
+            if len(audio_bytes) > settings.MAX_AUDIO_FETCH_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Audio payload too large ({len(audio_bytes)} bytes). "
+                        f"Limit is {settings.MAX_AUDIO_FETCH_BYTES} bytes."
+                    ),
+                )
+            mime_type = _infer_audio_mime_type(
+                audio_url=audio_url,
+                content_type=response.headers.get("content-type"),
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"prefetch audio failed for '{audio_url}': {exc}") from exc
+
+    encoded = base64.b64encode(audio_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+async def _prepare_audio_urls_for_vllm(audio_urls: list[str]) -> tuple[list[str], list[str]]:
+    """Convert remote audio URLs to data URLs; fallback to original URL if prefetch fails."""
+    prepared: list[str] = []
+    warnings: list[str] = []
+
+    for url in audio_urls:
+        try:
+            prepared.append(await _fetch_audio_url_as_data_url(url))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            warnings.append(str(exc))
+            prepared.append(url)
+
+    return prepared, warnings
+
+
+def _validate_video_url(video_url: str) -> str:
+    """Validate supported video URL formats for Gemma4 multimodal input."""
+    normalized = video_url.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="video_url cannot be empty")
+
+    if normalized.startswith("data:video/"):
+        return normalized
+
+    local_video_id = resolve_chat_video_id_from_url(normalized)
+    if local_video_id:
+        return normalized
+
+    parsed = urlparse(normalized)
+    if settings.ALLOW_PUBLIC_VIDEO_URLS and parsed.scheme in {"http", "https"} and parsed.netloc:
+        return normalized
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "video_url only supports local uploaded video URLs "
+            "('/api/chat/videos/{video_id}' or full URL with same path) "
+            "or data:video/* data URL. Public internet video URLs are disabled."
+        ),
+    )
+
+
+def _resolve_video_inputs(request: ChatRequest) -> list[str]:
+    """Resolve single/multi video URL inputs into a normalized list."""
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw in [request.video_url, *(request.video_urls or [])]:
+        if not raw:
+            continue
+        normalized = _validate_video_url(str(raw))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(normalized)
+    return resolved
+
+
+def _prepare_video_url_for_vllm(video_url: str) -> str:
+    """Prepare video transport payload for vLLM (data_url preferred for local uploads)."""
+    if video_url.startswith("data:video/"):
+        return video_url
+
+    local_video_id = resolve_chat_video_id_from_url(video_url)
+    if local_video_id:
+        if settings.LOCAL_VIDEO_TRANSPORT_MODE == "data_url":
+            return resolve_chat_video_data_url(local_video_id)
+        if video_url.startswith("/"):
+            return f"{settings.LOCAL_MEDIA_BASE_URL.rstrip('/')}{video_url}"
+        return video_url
+
+    return video_url
+
+
+def _prepare_video_urls_for_vllm(video_urls: list[str]) -> tuple[list[str], list[str]]:
+    """Normalize video URLs for vLLM payload (local path -> absolute URL)."""
+    prepared: list[str] = []
+    warnings: list[str] = []
+
+    for url in video_urls:
+        try:
+            prepared.append(_prepare_video_url_for_vllm(url))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            warnings.append(str(exc))
+            prepared.append(url)
+
+    return prepared, warnings
+
+
+def _resolve_inline_image_inputs(request: ChatRequest) -> tuple[list[str], list[str | None]]:
+    """Resolve inline image payloads from request (single + multiple)."""
+    payloads: list[str] = []
+    formats: list[str | None] = []
+
+    if request.image:
+        _enforce_image_payload_limit(request.image)
+        payloads.append(request.image)
+        formats.append(_resolve_image_format(request.image, request.image_format))
+
+    inline_images = _normalize_str_list(request.images)
+    inline_formats = _normalize_str_list(request.image_formats, lower=True)
+    for idx, image_data in enumerate(inline_images):
+        _enforce_image_payload_limit(image_data)
+        format_hint = inline_formats[idx] if idx < len(inline_formats) else request.image_format
+        payloads.append(image_data)
+        formats.append(_resolve_image_format(image_data, format_hint))
+
+    return payloads, formats
 
 
 def _enforce_file_payload_limit(file_data: str | None, file_name: str | None, file_format: str | None) -> str | None:
@@ -413,6 +753,26 @@ async def _analyze_image_with_vision_service(
         return "", False
 
 
+async def _analyze_images_with_vision_service(
+    image_payloads: list[str],
+    user_message: str,
+) -> str:
+    """Analyze multiple images with legacy vision proxy path and merge contexts."""
+    contexts: list[str] = []
+    for idx, payload in enumerate(image_payloads):
+        image_context, analyzed = await _analyze_image_with_vision_service(
+            image_data=payload,
+            user_message=user_message,
+        )
+        if not analyzed or not image_context:
+            continue
+        if len(image_payloads) > 1:
+            contexts.append(f"【图片 {idx + 1} 分析】\n{image_context}")
+        else:
+            contexts.append(image_context)
+    return "\n\n".join(contexts)
+
+
 def _merge_context(image_context: str, rag_context: str, file_context: str) -> str:
     """Merge image and RAG contexts into one prompt context block."""
     parts = []
@@ -423,6 +783,37 @@ def _merge_context(image_context: str, rag_context: str, file_context: str) -> s
     if file_context:
         parts.append(file_context)
     return "\n\n".join(parts)
+
+
+def _resolve_multimodal_mode(
+    *,
+    native_vllm_multimodal: bool,
+    has_image: bool,
+    has_audio: bool,
+    has_video: bool,
+    has_file: bool,
+) -> str:
+    """Resolve multimodal mode label for response metadata."""
+    if native_vllm_multimodal:
+        if has_image and has_audio and has_video:
+            return "gemma4_native_image_video_audio"
+        if has_image and has_video:
+            return "gemma4_native_image_video"
+        if has_image and has_audio:
+            return "gemma4_native_image_audio"
+        if has_video and has_audio:
+            return "gemma4_native_video_audio"
+        if has_image:
+            return "gemma4_native_image"
+        if has_video:
+            return "gemma4_native_video"
+        if has_audio:
+            return "gemma4_native_audio"
+    if has_image:
+        return "vision_proxy"
+    if has_file:
+        return "text_with_file"
+    return "text"
 
 
 def _score_reasoning_paragraph(paragraph: str) -> float:
@@ -535,22 +926,58 @@ async def get_chat_mode_config() -> ChatModeConfigResponse:
     return ChatModeConfigResponse(**_current_mode_config())
 
 
-@router.put("/mode-config", response_model=ChatModeConfigResponse)
-async def update_chat_mode_config(request: ChatModeUpdateRequest) -> ChatModeConfigResponse:
-    """Update runtime chat profile from frontend selection."""
-    if settings.LLM_PROVIDER != "vllm":
-        return ChatModeConfigResponse(**_current_mode_config())
+@router.post("/images/upload", response_model=ChatImageUploadResponse)
+async def upload_chat_image(file: UploadFile = File(...)) -> ChatImageUploadResponse:
+    """Upload a chat image and return lightweight image_id reference."""
+    payload = await persist_uploaded_chat_image(file)
+    return ChatImageUploadResponse(**payload)
 
-    normalized = _normalize_profile(request.deploy_profile)
-    if not normalized:
-        raise HTTPException(
-            status_code=400,
-            detail="deploy_profile must be one of: rag_text, vision, full, benchmark",
-        )
 
-    _set_runtime_profile_override(normalized)
-    logger.info("chat mode profile updated at runtime: %s", normalized)
-    return ChatModeConfigResponse(**_current_mode_config())
+@router.get("/images/{image_id}")
+async def get_chat_image(image_id: str):
+    """Fetch cached chat image by image_id for session history rendering."""
+    image_path, media_type = get_chat_image_file(image_id)
+    return FileResponse(
+        image_path,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.post("/audios/upload", response_model=ChatAudioUploadResponse)
+async def upload_chat_audio(file: UploadFile = File(...)) -> ChatAudioUploadResponse:
+    """Upload a chat audio file and return lightweight audio_id reference."""
+    payload = await persist_uploaded_chat_audio(file)
+    return ChatAudioUploadResponse(**payload)
+
+
+@router.get("/audios/{audio_id}")
+async def get_chat_audio(audio_id: str):
+    """Fetch cached chat audio by audio_id for session history rendering."""
+    audio_path, media_type = get_chat_audio_file(audio_id)
+    return FileResponse(
+        audio_path,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.post("/videos/upload", response_model=ChatVideoUploadResponse)
+async def upload_chat_video(file: UploadFile = File(...)) -> ChatVideoUploadResponse:
+    """Upload a chat video file and return lightweight video_id reference."""
+    payload = await persist_uploaded_chat_video(file)
+    return ChatVideoUploadResponse(**payload)
+
+
+@router.get("/videos/{video_id}")
+async def get_chat_video(video_id: str):
+    """Fetch cached chat video by video_id for session history rendering."""
+    video_path, media_type = get_chat_video_file(video_id)
+    return FileResponse(
+        video_path,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.post("/", response_model=ChatResponse)
@@ -570,28 +997,68 @@ async def chat(request: ChatRequest) -> ChatResponse:
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Model loading failed: {str(e)}")
 
-    _enforce_image_payload_limit(request.image)
+    resolved_image_payloads, resolved_image_formats, requested_cached_image_ids = _resolve_image_inputs(request)
+    resolved_audio_urls = _resolve_audio_inputs(request)
+    resolved_video_urls = _resolve_video_inputs(request)
+    inline_image_payloads, inline_image_formats = _resolve_inline_image_inputs(request)
     file_context, resolved_file_format = _build_file_context(
         file_data=request.file,
         file_name=request.file_name,
         file_format=request.file_format,
     )
     effective_thinking, effective_tool_calling, mode_warnings, mode_config = _resolve_mode_flags(request)
+    effective_max_tokens, effective_temperature, effective_top_p = _resolve_generation_overrides(request)
+    vllm_audio_urls = list(resolved_audio_urls)
+    vllm_video_urls = list(resolved_video_urls)
+    audio_prefetch_warnings: list[str] = []
+    if settings.LLM_PROVIDER == "vllm" and resolved_audio_urls:
+        vllm_audio_urls, audio_prefetch_warnings = await _prepare_audio_urls_for_vllm(resolved_audio_urls)
+        mode_warnings.extend(audio_prefetch_warnings)
+    video_prepare_warnings: list[str] = []
+    if settings.LLM_PROVIDER == "vllm" and resolved_video_urls:
+        vllm_video_urls, video_prepare_warnings = _prepare_video_urls_for_vllm(resolved_video_urls)
+        mode_warnings.extend(video_prepare_warnings)
 
     # Create or use existing session
     session_id = request.session_id or create_session()
 
-    image_format_to_store = _resolve_image_format(request.image, request.image_format)
+    cached_image_ids = list(requested_cached_image_ids)
+    session_image_data: str | None = None
+    for idx, inline_image in enumerate(inline_image_payloads):
+        try:
+            cached = persist_chat_image_from_base64(inline_image)
+            cached_image_ids.append(str(cached["image_id"]))
+            resolved_image_formats[idx] = str(cached.get("image_format") or resolved_image_formats[idx] or "jpeg")
+        except HTTPException as cache_error:
+            logger.warning("Persist inline image failed: %s", cache_error.detail)
+            if not session_image_data and len(_extract_base64_payload(inline_image)) <= settings.MAX_SESSION_IMAGE_BASE64_CHARS:
+                session_image_data = inline_image
+
+    primary_image_id = cached_image_ids[0] if cached_image_ids else None
+    primary_image_format = resolved_image_formats[0] if resolved_image_formats else None
+    image_format_to_store = (
+        primary_image_format
+        or (inline_image_formats[0] if inline_image_formats else None)
+        or request.image_format
+    )
     add_message(
         session_id,
         "user",
         request.message,
-        has_image=bool(request.image),
-        image_data=request.image,
+        has_image=bool(resolved_image_payloads),
+        image_data=session_image_data,
         image_format=image_format_to_store,
+        image_id=primary_image_id,
+        image_ids=cached_image_ids or None,
         has_file=bool(request.file),
         file_name=request.file_name,
         file_format=resolved_file_format,
+        has_audio=bool(resolved_audio_urls),
+        audio_url=resolved_audio_urls[0] if resolved_audio_urls else None,
+        audio_urls=resolved_audio_urls or None,
+        has_video=bool(resolved_video_urls),
+        video_url=resolved_video_urls[0] if resolved_video_urls else None,
+        video_urls=resolved_video_urls or None,
     )
 
     rag_context, sources = _retrieve_rag_context(
@@ -600,14 +1067,22 @@ async def chat(request: ChatRequest) -> ChatResponse:
         use_search=request.use_search,
     )
 
-    use_native_vllm_multimodal = settings.LLM_PROVIDER == "vllm" and bool(request.image)
+    use_native_vllm_multimodal = settings.LLM_PROVIDER == "vllm" and bool(
+        resolved_image_payloads or resolved_audio_urls or resolved_video_urls
+    )
+    use_native_vllm_image = settings.LLM_PROVIDER == "vllm" and bool(resolved_image_payloads)
     image_context = ""
-    has_image = bool(request.image)
+    has_image = bool(resolved_image_payloads)
     has_file = bool(request.file)
+    has_audio = bool(resolved_audio_urls)
+    has_video = bool(resolved_video_urls)
+    audio_prefetched_count = sum(
+        1 for raw, prepared in zip(resolved_audio_urls, vllm_audio_urls) if raw != prepared
+    )
 
-    if request.image and not use_native_vllm_multimodal:
-        image_context, _ = await _analyze_image_with_vision_service(
-            image_data=request.image,
+    if resolved_image_payloads and not use_native_vllm_image:
+        image_context = await _analyze_images_with_vision_service(
+            image_payloads=resolved_image_payloads,
             user_message=request.message,
         )
 
@@ -618,10 +1093,35 @@ async def chat(request: ChatRequest) -> ChatResponse:
         response_text = generate_response(
             question=request.message,
             context=combined_context,
-            image_data=request.image if use_native_vllm_multimodal else None,
-            image_format=image_format_to_store if use_native_vllm_multimodal else None,
+            image_data=resolved_image_payloads[0] if use_native_vllm_multimodal and resolved_image_payloads else None,
+            image_format=resolved_image_formats[0] if use_native_vllm_multimodal and resolved_image_formats else None,
+            image_data_list=(
+                resolved_image_payloads[1:]
+                if use_native_vllm_image and len(resolved_image_payloads) > 1
+                else None
+            ),
+            image_format_list=(
+                resolved_image_formats[1:]
+                if use_native_vllm_image and len(resolved_image_formats) > 1
+                else None
+            ),
+            audio_url=vllm_audio_urls[0] if use_native_vllm_multimodal and vllm_audio_urls else None,
+            audio_url_list=(
+                vllm_audio_urls[1:]
+                if use_native_vllm_multimodal and len(vllm_audio_urls) > 1
+                else None
+            ),
+            video_url=vllm_video_urls[0] if use_native_vllm_multimodal and vllm_video_urls else None,
+            video_url_list=(
+                vllm_video_urls[1:]
+                if use_native_vllm_multimodal and len(vllm_video_urls) > 1
+                else None
+            ),
             enable_thinking=effective_thinking,
             enable_tool_calling=effective_tool_calling,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
@@ -649,12 +1149,26 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "model": get_active_model_name(),
             "use_rag": bool(rag_context),
             "has_image": has_image,
+            "has_audio": has_audio,
+            "has_video": has_video,
             "has_file": has_file,
-            "multimodal_mode": (
-                "gemma4_native"
-                if use_native_vllm_multimodal
-                else ("vision_proxy" if request.image else ("text_with_file" if request.file else "text"))
+            "multimodal_mode": _resolve_multimodal_mode(
+                native_vllm_multimodal=use_native_vllm_multimodal,
+                has_image=has_image,
+                has_audio=has_audio,
+                has_video=has_video,
+                has_file=has_file,
             ),
+            "image_id": primary_image_id,
+            "image_ids": cached_image_ids,
+            "image_count": len(resolved_image_payloads),
+            "audio_url": resolved_audio_urls[0] if resolved_audio_urls else None,
+            "audio_urls": resolved_audio_urls,
+            "audio_count": len(resolved_audio_urls),
+            "audio_prefetched_count": audio_prefetched_count,
+            "video_url": resolved_video_urls[0] if resolved_video_urls else None,
+            "video_urls": resolved_video_urls,
+            "video_count": len(resolved_video_urls),
             "deploy_profile": mode_config["deploy_profile"],
             "requested_deploy_profile": request.deploy_profile,
             "profile_source": mode_config.get("profile_source"),
@@ -663,6 +1177,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "requested_enable_thinking": request.enable_thinking,
             "requested_enable_tool_calling": request.enable_tool_calling,
             "mode_warnings": mode_warnings,
+            "requested_max_tokens": request.max_tokens,
+            "effective_max_tokens": effective_max_tokens,
+            "effective_temperature": effective_temperature,
+            "effective_top_p": effective_top_p,
             "reasoning_content": reasoning_content,
             "final_content": final_content or display_content,
         },
@@ -673,7 +1191,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 async def chat_stream(request: ChatRequest):
     """Process a chat request with streaming response.
 
-    Supports multimodal input when an image is provided in the request.
+    Supports multimodal input when image/audio/video is provided in the request.
 
     Args:
         request: Chat request with message, optional image, and session info
@@ -688,40 +1206,82 @@ async def chat_stream(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Model loading failed: {str(e)}")
 
-    _enforce_image_payload_limit(request.image)
+    resolved_image_payloads, resolved_image_formats, requested_cached_image_ids = _resolve_image_inputs(request)
+    resolved_audio_urls = _resolve_audio_inputs(request)
+    resolved_video_urls = _resolve_video_inputs(request)
+    inline_image_payloads, inline_image_formats = _resolve_inline_image_inputs(request)
     file_context, resolved_file_format = _build_file_context(
         file_data=request.file,
         file_name=request.file_name,
         file_format=request.file_format,
     )
     effective_thinking, effective_tool_calling, mode_warnings, mode_config = _resolve_mode_flags(request)
+    effective_max_tokens, effective_temperature, effective_top_p = _resolve_generation_overrides(request)
+    vllm_audio_urls = list(resolved_audio_urls)
+    vllm_video_urls = list(resolved_video_urls)
+    audio_prefetch_warnings: list[str] = []
+    if settings.LLM_PROVIDER == "vllm" and resolved_audio_urls:
+        vllm_audio_urls, audio_prefetch_warnings = await _prepare_audio_urls_for_vllm(resolved_audio_urls)
+        mode_warnings.extend(audio_prefetch_warnings)
+    video_prepare_warnings: list[str] = []
+    if settings.LLM_PROVIDER == "vllm" and resolved_video_urls:
+        vllm_video_urls, video_prepare_warnings = _prepare_video_urls_for_vllm(resolved_video_urls)
+        mode_warnings.extend(video_prepare_warnings)
 
     # Create or use existing session
     session_id = request.session_id or create_session()
 
-    use_native_vllm_multimodal = settings.LLM_PROVIDER == "vllm" and bool(request.image)
+    cached_image_ids = list(requested_cached_image_ids)
+    session_image_data: str | None = None
+    for idx, inline_image in enumerate(inline_image_payloads):
+        try:
+            cached = persist_chat_image_from_base64(inline_image)
+            cached_image_ids.append(str(cached["image_id"]))
+            resolved_image_formats[idx] = str(cached.get("image_format") or resolved_image_formats[idx] or "jpeg")
+        except HTTPException as cache_error:
+            logger.warning("Persist inline image failed: %s", cache_error.detail)
+            if not session_image_data and len(_extract_base64_payload(inline_image)) <= settings.MAX_SESSION_IMAGE_BASE64_CHARS:
+                session_image_data = inline_image
+
+    use_native_vllm_multimodal = settings.LLM_PROVIDER == "vllm" and bool(
+        resolved_image_payloads or resolved_audio_urls or resolved_video_urls
+    )
+    use_native_vllm_image = settings.LLM_PROVIDER == "vllm" and bool(resolved_image_payloads)
     image_context = ""
-    has_image = bool(request.image)
+    has_image = bool(resolved_image_payloads)
+    has_audio = bool(resolved_audio_urls)
+    has_video = bool(resolved_video_urls)
     has_file = bool(request.file)
-    image_format_to_store = _resolve_image_format(request.image, request.image_format)
+    audio_prefetched_count = sum(
+        1 for raw, prepared in zip(resolved_audio_urls, vllm_audio_urls) if raw != prepared
+    )
+    primary_image_id = cached_image_ids[0] if cached_image_ids else None
+    primary_image_format = resolved_image_formats[0] if resolved_image_formats else None
+    image_format_to_store = (
+        primary_image_format
+        or (inline_image_formats[0] if inline_image_formats else None)
+        or request.image_format
+    )
 
     logger.info(
-        "chat_stream request: session=%s msg_len=%d has_image=%s has_file=%s image_chars=%d file_chars=%d provider=%s native_vllm_mm=%s image_format=%s",
+        "chat_stream request: session=%s msg_len=%d image_count=%d audio_count=%d video_count=%d has_file=%s image_chars=%d file_chars=%d provider=%s native_vllm_mm=%s image_format=%s",
         session_id,
         len(request.message or ""),
-        has_image,
+        len(resolved_image_payloads),
+        len(vllm_audio_urls),
+        len(vllm_video_urls),
         has_file,
-        len(request.image or ""),
+        sum(len(item or "") for item in resolved_image_payloads),
         len(request.file or ""),
         settings.LLM_PROVIDER,
         use_native_vllm_multimodal,
         image_format_to_store,
     )
 
-    if request.image and not use_native_vllm_multimodal:
+    if resolved_image_payloads and not use_native_vllm_image:
         logger.info("chat_stream using vision proxy path before LLM generation")
-        image_context, _ = await _analyze_image_with_vision_service(
-            image_data=request.image,
+        image_context = await _analyze_images_with_vision_service(
+            image_payloads=resolved_image_payloads,
             user_message=request.message,
         )
 
@@ -730,12 +1290,20 @@ async def chat_stream(request: ChatRequest):
         session_id,
         "user",
         request.message,
-        has_image=bool(request.image),
-        image_data=request.image,
+        has_image=bool(resolved_image_payloads),
+        image_data=session_image_data,
         image_format=image_format_to_store,
+        image_id=primary_image_id,
+        image_ids=cached_image_ids or None,
         has_file=has_file,
         file_name=request.file_name,
         file_format=resolved_file_format,
+        has_audio=has_audio,
+        audio_url=resolved_audio_urls[0] if resolved_audio_urls else None,
+        audio_urls=resolved_audio_urls or None,
+        has_video=has_video,
+        video_url=resolved_video_urls[0] if resolved_video_urls else None,
+        video_urls=resolved_video_urls or None,
     )
 
     rag_context, sources = _retrieve_rag_context(
@@ -756,12 +1324,26 @@ async def chat_stream(request: ChatRequest):
                     "sources": sources,
                     "has_context": bool(combined_context or use_native_vllm_multimodal),
                     "has_image": has_image,
+                    "has_audio": has_audio,
+                    "has_video": has_video,
                     "has_file": has_file,
-                    "multimodal_mode": (
-                        "gemma4_native"
-                        if use_native_vllm_multimodal
-                        else ("vision_proxy" if request.image else ("text_with_file" if request.file else "text"))
+                    "multimodal_mode": _resolve_multimodal_mode(
+                        native_vllm_multimodal=use_native_vllm_multimodal,
+                        has_image=has_image,
+                        has_audio=has_audio,
+                        has_video=has_video,
+                        has_file=has_file,
                     ),
+                    "image_id": primary_image_id,
+                    "image_ids": cached_image_ids,
+                    "image_count": len(resolved_image_payloads),
+                    "audio_url": resolved_audio_urls[0] if resolved_audio_urls else None,
+                    "audio_urls": resolved_audio_urls,
+                    "audio_count": len(resolved_audio_urls),
+                    "audio_prefetched_count": audio_prefetched_count,
+                    "video_url": resolved_video_urls[0] if resolved_video_urls else None,
+                    "video_urls": resolved_video_urls,
+                    "video_count": len(resolved_video_urls),
                     "deploy_profile": mode_config["deploy_profile"],
                     "requested_deploy_profile": request.deploy_profile,
                     "profile_source": mode_config.get("profile_source"),
@@ -770,6 +1352,10 @@ async def chat_stream(request: ChatRequest):
                     "requested_enable_thinking": request.enable_thinking,
                     "requested_enable_tool_calling": request.enable_tool_calling,
                     "mode_warnings": mode_warnings,
+                    "requested_max_tokens": request.max_tokens,
+                    "effective_max_tokens": effective_max_tokens,
+                    "effective_temperature": effective_temperature,
+                    "effective_top_p": effective_top_p,
                 }),
             }
 
@@ -779,10 +1365,43 @@ async def chat_stream(request: ChatRequest):
             async for token in astream_response(
                 question=effective_question,
                 context=combined_context,
-                image_data=request.image if use_native_vllm_multimodal else None,
-                image_format=image_format_to_store if use_native_vllm_multimodal else None,
+                image_data=(
+                    resolved_image_payloads[0]
+                    if use_native_vllm_image and resolved_image_payloads
+                    else None
+                ),
+                image_format=(
+                    resolved_image_formats[0]
+                    if use_native_vllm_image and resolved_image_formats
+                    else None
+                ),
+                image_data_list=(
+                    resolved_image_payloads[1:]
+                    if use_native_vllm_image and len(resolved_image_payloads) > 1
+                    else None
+                ),
+                image_format_list=(
+                    resolved_image_formats[1:]
+                    if use_native_vllm_image and len(resolved_image_formats) > 1
+                    else None
+                ),
+                audio_url=vllm_audio_urls[0] if use_native_vllm_multimodal and vllm_audio_urls else None,
+                audio_url_list=(
+                    vllm_audio_urls[1:]
+                    if use_native_vllm_multimodal and len(vllm_audio_urls) > 1
+                    else None
+                ),
+                video_url=vllm_video_urls[0] if use_native_vllm_multimodal and vllm_video_urls else None,
+                video_url_list=(
+                    vllm_video_urls[1:]
+                    if use_native_vllm_multimodal and len(vllm_video_urls) > 1
+                    else None
+                ),
                 enable_thinking=effective_thinking,
                 enable_tool_calling=effective_tool_calling,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
             ):
                 full_response += token
                 yield {

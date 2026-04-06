@@ -61,8 +61,41 @@ python3 vllm_test/benchmark_gemma4_vllm.py
 - 请求吞吐（req/s）
 - 生成吞吐（tok/s，基于 `usage.completion_tokens`）
 - TTFT（仅 `--stream`）
+- 支持 `--unique-prompt-per-request`（请求级唯一前缀，减少 prefix cache 复用，适合做 KV cache 压力场景）
 
-## 3. 后端链路压测（本地后端 -> vLLM）
+## 3. 高 KV Cache 压力测试（长上下文 + 高并发）
+
+脚本：`vllm_test/kv_cache_stress_gemma4_vllm.py`
+
+用途：
+- 自动构造超长上下文 prompt（默认至少 64000 字符）
+- 默认按 `/v1/models` 的 `max_model_len` 自动放大 prompt（目标 `92%` 上下文占用，支持关闭）
+- 默认使用高并发 + 大输出（`concurrency=32`、`max_tokens=2048`）
+- 默认开启 `unique_prompt_per_request`，减少请求间前缀缓存共享，拉高 KV cache 占用
+
+执行命令：
+
+```bash
+python3 vllm_test/kv_cache_stress_gemma4_vllm.py \
+  --base-url http://127.0.0.1:8100/v1 \
+  --api-key EMPTY \
+  --model gemma4-e4b-it \
+  --requests 192 \
+  --concurrency 32 \
+  --max-tokens 2048
+```
+
+常用对比：
+
+```bash
+# 关闭请求级唯一前缀，用于和 prefix cache 复用场景做对比
+python3 vllm_test/kv_cache_stress_gemma4_vllm.py --shared-prompt
+
+# 关闭按 model_max_len 自动放大 prompt（仅使用 --min-prompt-chars）
+python3 vllm_test/kv_cache_stress_gemma4_vllm.py --no-auto-prompt-size
+```
+
+## 4. 后端链路压测（本地后端 -> vLLM）
 
 快速执行：
 
@@ -95,7 +128,7 @@ MIN_SUCCESS_RATE=99.0 \
 bash vllm_test/sweep_concurrency.sh
 ```
 
-## 4. 建议联动观察
+## 5. 建议联动观察
 
 压测时同时观察 vLLM 服务日志中的：
 - `Running`
@@ -107,7 +140,7 @@ bash vllm_test/sweep_concurrency.sh
 - `p95` 偏高但成功率高：优先降低 `max_tokens`
 - `failed` 增加：优先排查网络、超时、服务端错误日志
 
-## 5. 严格测试套件（多阶段 + SLO 门禁）
+## 6. 严格测试套件（多阶段 + SLO 门禁）
 
 脚本：`vllm_test/strict_suite_gemma4_vllm.py`
 
@@ -148,7 +181,7 @@ python3 vllm_test/strict_suite_gemma4_vllm.py --fail-fast
 - `0`：所有场景通过
 - `2`：有场景失败（触发门禁）
 
-## 6. 部署能力探测（Gemma4 功能验收）
+## 7. 部署能力探测（Gemma4 功能验收）
 
 脚本：`vllm_test/probe_gemma4_capabilities.py`
 
