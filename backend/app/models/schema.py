@@ -1,8 +1,12 @@
 """Pydantic models for request/response validation."""
 
+import re
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Any
 from pydantic import BaseModel, Field, model_validator
+
+_AUDIO_FILE_EXTENSIONS = {"wav", "mp3", "ogg", "webm", "m4a", "mp4", "flac"}
 
 
 # Chat Models
@@ -29,6 +33,7 @@ class ChatMessage(BaseModel):
     video_urls: Optional[list[str]] = Field(None, description="Multiple video URLs for multimodal requests")
     reasoning_content: Optional[str] = Field(None, description="Structured reasoning content when thinking is enabled")
     final_content: Optional[str] = Field(None, description="Structured final answer content")
+    tool_traces: Optional[list[dict]] = Field(None, description="Tool execution traces for assistant message")
 
 
 class ChatRequest(BaseModel):
@@ -72,6 +77,13 @@ class ChatRequest(BaseModel):
     )
     enable_thinking: bool = Field(False, description="Enable Gemma4 thinking mode when supported")
     enable_tool_calling: bool = Field(False, description="Enable tool calling mode when supported")
+    response_format: Optional[dict[str, Any]] = Field(
+        None,
+        description=(
+            "OpenAI-compatible response_format for guided decoding. "
+            "Example: {'type':'json_schema','json_schema':{'name':'x','schema':{...}}}"
+        ),
+    )
     max_tokens: Optional[int] = Field(
         None,
         ge=1,
@@ -93,6 +105,36 @@ class ChatRequest(BaseModel):
         None,
         description="Deprecated: runtime profile override is ignored; server profile is fixed at startup",
     )
+
+    def _resolve_attachment_format(self) -> str | None:
+        """Best-effort resolve attachment extension for file-only inputs."""
+        if self.file_format:
+            normalized = self.file_format.strip().lower().lstrip(".")
+            if normalized:
+                return normalized
+
+        if self.file_name:
+            suffix = Path(self.file_name).suffix.lower().lstrip(".")
+            if suffix:
+                return suffix
+
+        if self.file and self.file.startswith("data:") and "," in self.file:
+            match = re.search(r"data:[^;/]+/([a-zA-Z0-9+.-]+);base64,", self.file)
+            if match:
+                return match.group(1).lower()
+
+        return None
+
+    def _is_audio_file_attachment(self) -> bool:
+        """Whether `file` payload is actually an audio attachment."""
+        file_payload = (self.file or "").strip()
+        if not file_payload:
+            return False
+        if file_payload.startswith("data:audio/"):
+            return True
+
+        resolved_format = self._resolve_attachment_format()
+        return bool(resolved_format and resolved_format in _AUDIO_FILE_EXTENSIONS)
 
     @model_validator(mode="after")
     def validate_multimodal_input(self) -> "ChatRequest":
@@ -126,7 +168,7 @@ class ChatRequest(BaseModel):
         has_multi_cached = bool(self.image_ids)
         has_image = bool(has_single_inline or has_single_cached or has_multi_inline or has_multi_cached)
         has_file = bool(self.file and self.file.strip())
-        has_audio = bool(self.audio_url or self.audio_urls)
+        has_audio = bool(self.audio_url or self.audio_urls or self._is_audio_file_attachment())
         has_video = bool(self.video_url or self.video_urls)
 
         if not has_message and not has_image and not has_file and not has_audio and not has_video:
@@ -158,6 +200,29 @@ class ChatRequest(BaseModel):
 
         if self.image_id:
             self.image_id = self.image_id.strip().lower()
+
+        if self.response_format is not None:
+            if not isinstance(self.response_format, dict):
+                raise ValueError("response_format must be a JSON object")
+            format_type = str(self.response_format.get("type") or "").strip().lower()
+            if format_type != "json_schema":
+                raise ValueError("response_format.type currently only supports 'json_schema'")
+            json_schema_obj = self.response_format.get("json_schema")
+            if not isinstance(json_schema_obj, dict):
+                raise ValueError("response_format.json_schema must be an object")
+            schema_name = str(json_schema_obj.get("name") or "").strip()
+            schema_body = json_schema_obj.get("schema")
+            if not schema_name:
+                raise ValueError("response_format.json_schema.name is required")
+            if not isinstance(schema_body, dict):
+                raise ValueError("response_format.json_schema.schema must be an object")
+            self.response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": schema_body,
+                },
+            }
 
         return self
 
@@ -377,6 +442,7 @@ class ChatModeConfigResponse(BaseModel):
     supports_video: bool = Field(..., description="Whether video mode is supported")
     supports_thinking: bool = Field(..., description="Whether thinking mode is supported")
     supports_tool_calling: bool = Field(..., description="Whether tool calling mode is supported")
+    supports_structured_output: bool = Field(..., description="Whether JSON schema structured output is supported")
     available_profiles: list[str] = Field(default_factory=list, description="Reserved field; runtime profile switching disabled")
     configured_profile: Optional[str] = Field(None, description="Profile from backend .env")
     runtime_profile_override: Optional[str] = Field(None, description="Always null when runtime switching is disabled")

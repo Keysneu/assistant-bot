@@ -52,6 +52,7 @@ export interface ChatMessage {
   video_urls?: string[];
   reasoning_content?: string;
   final_content?: string;
+  tool_traces?: Array<Record<string, unknown>>;
 }
 
 // Multimodal chat request with optional image
@@ -75,6 +76,14 @@ export interface MultimodalChatRequest {
   video_urls?: string[];
   enable_thinking?: boolean;
   enable_tool_calling?: boolean;
+  response_format?: {
+    type: "json_schema";
+    json_schema: {
+      name: string;
+      schema: Record<string, unknown>;
+      strict?: boolean;
+    };
+  };
 }
 
 function resolveDefaultApiBaseUrl(): string {
@@ -205,9 +214,15 @@ export async function* streamMessage(
     profile_source?: string;
     enable_thinking?: boolean;
     enable_tool_calling?: boolean;
+    enable_structured_output?: boolean;
     requested_enable_thinking?: boolean;
     requested_enable_tool_calling?: boolean;
+    requested_structured_output?: boolean;
+    response_format_type?: string;
+    response_schema_name?: string;
     mode_warnings?: string[];
+    tool_traces?: Array<Record<string, unknown>>;
+    tool_trace_count?: number;
   }) => void,
   onDone?: (done: {
     session_id?: string;
@@ -215,12 +230,17 @@ export async function* streamMessage(
     display_content?: string;
     reasoning_content?: string | null;
     final_content?: string | null;
+    tool_traces?: Array<Record<string, unknown>>;
+    tool_trace_count?: number;
   }) => void,
+  onReasoningToken?: (token: string) => void,
+  onToolTrace?: (trace: Record<string, unknown>) => void,
   imageIds?: string[],
   audioUrl?: string,
   audioUrls?: string[],
   videoUrl?: string,
   videoUrls?: string[],
+  responseFormat?: MultimodalChatRequest["response_format"],
 ): AsyncGenerator<string, void, unknown> {
   const normalizedImageIds = (imageIds || []).map((item) => item.trim()).filter(Boolean);
   const normalizedAudioUrls = [audioUrl || "", ...(audioUrls || [])]
@@ -255,6 +275,7 @@ export async function* streamMessage(
     session_id: sessionId,
     enable_thinking: Boolean(enableThinking),
     enable_tool_calling: Boolean(enableToolCalling),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
   };
 
   // Add cached image reference if provided
@@ -344,6 +365,15 @@ export async function* streamMessage(
           if (currentEvent === "metadata") {
             if (onMetadata) {
               onMetadata(parsed);
+            }
+          } else if (currentEvent === "reasoning") {
+            const token = String(parsed.token || "");
+            if (token && onReasoningToken) {
+              onReasoningToken(token);
+            }
+          } else if (currentEvent === "tool_trace") {
+            if (onToolTrace && parsed?.trace && typeof parsed.trace === "object") {
+              onToolTrace(parsed.trace as Record<string, unknown>);
             }
           } else if (currentEvent === "token") {
             yield parsed.token || "";

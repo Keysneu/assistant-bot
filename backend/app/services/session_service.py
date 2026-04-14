@@ -52,6 +52,7 @@ def _load_sessions():
                         video_urls=msg.get("video_urls"),
                         reasoning_content=msg.get("reasoning_content"),
                         final_content=msg.get("final_content"),
+                        tool_traces=msg.get("tool_traces"),
                     )
                     for msg in messages_data
                 ]
@@ -94,6 +95,7 @@ def _save_sessions():
                 "video_urls": msg.video_urls if hasattr(msg, "video_urls") else None,
                 "reasoning_content": msg.reasoning_content if hasattr(msg, "reasoning_content") else None,
                 "final_content": msg.final_content if hasattr(msg, "final_content") else None,
+                "tool_traces": msg.tool_traces if hasattr(msg, "tool_traces") else None,
             }
             for msg in messages
         ]
@@ -150,6 +152,7 @@ def add_message(
     video_urls: list[str] | None = None,
     reasoning_content: str = None,
     final_content: str = None,
+    tool_traces: list[dict] | None = None,
 ) -> ChatMessage:
     """Add a message to the conversation history.
 
@@ -173,6 +176,7 @@ def add_message(
         video_urls: Video URL list for multimodal request
         reasoning_content: Structured reasoning content for assistant message
         final_content: Structured final answer content for assistant message
+        tool_traces: Tool execution trace list for assistant message
 
     Returns:
         The created message
@@ -201,6 +205,7 @@ def add_message(
         video_urls=video_urls,
         reasoning_content=reasoning_content,
         final_content=final_content,
+        tool_traces=tool_traces,
     )
     _sessions[session_id].append(message)
 
@@ -310,6 +315,7 @@ def get_session_info(session_id: str) -> Optional[Dict]:
                 "video_urls": msg.video_urls if hasattr(msg, "video_urls") else None,
                 "reasoning_content": msg.reasoning_content if hasattr(msg, "reasoning_content") else None,
                 "final_content": msg.final_content if hasattr(msg, "final_content") else None,
+                "tool_traces": msg.tool_traces if hasattr(msg, "tool_traces") else None,
             }
             for msg in _sessions[session_id]
         ]

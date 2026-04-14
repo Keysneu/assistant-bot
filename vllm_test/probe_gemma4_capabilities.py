@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -128,6 +129,53 @@ def extract_message_content(body: dict[str, Any]) -> str:
     return ""
 
 
+def _strip_markdown_json_fence(content: str) -> str:
+    """Strip optional markdown json code fence for diagnostics."""
+    text = (content or "").strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def validate_topic_summary_json(content: str) -> tuple[bool, str]:
+    """Strict validator for structured output stability checks."""
+    raw = (content or "").strip()
+    if not raw:
+        return False, "empty response"
+
+    # We intentionally require pure JSON text here to catch markdown fence leaks.
+    if raw.startswith("```"):
+        cleaned = _strip_markdown_json_fence(raw)
+        try:
+            json.loads(cleaned)
+            return False, "json wrapped by markdown fence (not strict pure json)"
+        except Exception:
+            return False, "markdown fenced and invalid json"
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False, f"not valid json: {raw[:120]}"
+
+    if not isinstance(parsed, dict):
+        return False, f"json is not object: {type(parsed).__name__}"
+
+    keys = set(parsed.keys())
+    expected = {"topic", "summary"}
+    if keys != expected:
+        return False, f"schema mismatch keys={sorted(list(keys))}, expected={sorted(list(expected))}"
+
+    topic = parsed.get("topic")
+    summary = parsed.get("summary")
+    if not isinstance(topic, str) or not topic.strip():
+        return False, "field 'topic' must be non-empty string"
+    if not isinstance(summary, str) or not summary.strip():
+        return False, "field 'summary' must be non-empty string"
+
+    return True, "strict schema-compliant json"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Probe Gemma4 deployment capabilities.")
     parser.add_argument("--base-url", default=os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8100/v1"))
@@ -135,6 +183,18 @@ def main() -> int:
     parser.add_argument("--model", default=os.getenv("VLLM_MODEL", "gemma4-e4b-it"))
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--require-full", action="store_true", help="Fail when any capability check fails.")
+    parser.add_argument(
+        "--structured-runs",
+        type=int,
+        default=5,
+        help="Number of repeated runs for structured_output stability check (default: 5).",
+    )
+    parser.add_argument(
+        "--structured-min-pass-rate",
+        type=float,
+        default=1.0,
+        help="Minimum pass rate required for structured_output to pass (default: 1.0).",
+    )
     parser.add_argument("--out-dir", default="vllm_test/results")
     args = parser.parse_args()
 
@@ -201,7 +261,21 @@ def main() -> int:
 
     structured_payload = {
         "model": args.model,
-        "messages": [{"role": "user", "content": "返回主题和一句摘要"}],
+        "messages": [
+            {
+                "role": "system",
+                "content": "Output ONLY valid JSON. No markdown/code fence and no extra text.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Text: Apple released a new chip for laptops. "
+                    "Return topic and one-sentence summary."
+                ),
+            },
+        ],
+        "temperature": 0.0,
+        "top_p": 1.0,
         "max_tokens": 128,
         "response_format": {
             "type": "json_schema",
@@ -220,29 +294,67 @@ def main() -> int:
         },
     }
 
-    def structured_validator(body: dict[str, Any]) -> tuple[bool, str]:
-        content = extract_message_content(body)
-        if not content:
-            return False, "empty response"
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            return False, f"not valid json: {content[:120]}"
+    structured_runs = max(1, int(args.structured_runs))
+    structured_start = time.perf_counter()
+    structured_pass = 0
+    structured_fail_reasons: list[str] = []
+    structured_samples: list[dict[str, Any]] = []
 
-        if not isinstance(parsed, dict):
-            return False, f"json is not object: {type(parsed).__name__}"
-        if "topic" not in parsed or "summary" not in parsed:
-            return False, f"missing keys in {parsed}"
-        return True, "valid json schema output"
+    for idx in range(structured_runs):
+        try:
+            status, body = http_json_request(
+                url=f"{args.base_url}/chat/completions",
+                method="POST",
+                headers=headers,
+                payload=structured_payload,
+                timeout_s=args.timeout,
+            )
+            if not (200 <= status < 300):
+                reason = f"status={status}"
+                structured_fail_reasons.append(reason)
+                structured_samples.append({"run": idx + 1, "ok": False, "detail": reason, "content": ""})
+                continue
+
+            content = extract_message_content(body)
+            ok, detail = validate_topic_summary_json(content)
+            if ok:
+                structured_pass += 1
+            else:
+                structured_fail_reasons.append(detail)
+            structured_samples.append(
+                {
+                    "run": idx + 1,
+                    "ok": ok,
+                    "detail": detail,
+                    "content_preview": content[:180],
+                }
+            )
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else str(exc)
+            reason = f"HTTPError {exc.code}: {detail[:200]}"
+            structured_fail_reasons.append(reason)
+            structured_samples.append({"run": idx + 1, "ok": False, "detail": reason, "content_preview": ""})
+        except Exception as exc:  # pylint: disable=broad-except
+            reason = str(exc)
+            structured_fail_reasons.append(reason)
+            structured_samples.append({"run": idx + 1, "ok": False, "detail": reason, "content_preview": ""})
+
+    structured_latency = time.perf_counter() - structured_start
+    structured_pass_rate = structured_pass / structured_runs
+    structured_ok = structured_pass_rate >= float(args.structured_min_pass_rate)
+    structured_detail = (
+        f"pass_rate={structured_pass_rate:.2%} ({structured_pass}/{structured_runs}), "
+        f"threshold={float(args.structured_min_pass_rate):.2%}"
+    )
+    if structured_fail_reasons:
+        structured_detail += f", first_fail={structured_fail_reasons[0]}"
 
     results.append(
-        check_chat_capability(
+        CapabilityResult(
             "structured_output",
-            args.base_url,
-            headers,
-            structured_payload,
-            args.timeout,
-            structured_validator,
+            structured_ok,
+            structured_latency,
+            structured_detail,
         )
     )
 
@@ -272,19 +384,21 @@ def main() -> int:
 
     tool_payload = {
         "model": args.model,
-        "messages": [{"role": "user", "content": "请调用 weather_lookup 工具查询上海天气。"}],
+        "messages": [{"role": "user", "content": "请调用 search_web_realtime 工具查询 OpenAI 最近一天新闻。"}],
         "tools": [
             {
                 "type": "function",
                 "function": {
-                    "name": "weather_lookup",
-                    "description": "Query weather by city",
+                    "name": "search_web_realtime",
+                    "description": "Search real-time web news and latest headlines.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "city": {"type": "string"},
+                            "query": {"type": "string"},
+                            "freshness": {"type": "string"},
+                            "limit": {"type": "integer"},
                         },
-                        "required": ["city"],
+                        "required": ["query"],
                     },
                 },
             }
@@ -321,6 +435,13 @@ def main() -> int:
         "model": args.model,
         "require_full": args.require_full,
         "results": [asdict(item) for item in results],
+        "structured_output_stats": {
+            "runs": structured_runs,
+            "passed": structured_pass,
+            "pass_rate": structured_pass_rate,
+            "required_min_pass_rate": float(args.structured_min_pass_rate),
+            "samples": structured_samples,
+        },
         "summary": {
             "passed": sum(1 for item in results if item.passed),
             "total": len(results),

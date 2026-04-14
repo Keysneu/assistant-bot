@@ -43,6 +43,8 @@ type StreamDonePayload = {
   display_content?: string;
   reasoning_content?: string | null;
   final_content?: string | null;
+  tool_traces?: Array<Record<string, unknown>>;
+  tool_trace_count?: number;
 };
 
 const STREAM_FLUSH_INTERVAL_MS = 50;
@@ -289,6 +291,8 @@ export function ChatBox({
   const [modeWarnings, setModeWarnings] = useState<string[]>([]);
   const [streamingAssistantIndex, setStreamingAssistantIndex] = useState<number | null>(null);
   const [streamingAssistantContent, setStreamingAssistantContent] = useState("");
+  const [streamingAssistantReasoning, setStreamingAssistantReasoning] = useState("");
+  const [streamingToolTraces, setStreamingToolTraces] = useState<Array<Record<string, unknown>>>([]);
   const [streamingThinkingPanelLocked, setStreamingThinkingPanelLocked] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
@@ -299,6 +303,7 @@ export function ChatBox({
   const hasAttemptedConnection = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
   const streamBufferRef = useRef("");
+  const reasoningBufferRef = useRef("");
   const lastStreamFlushAtRef = useRef(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -345,6 +350,7 @@ export function ChatBox({
             video_urls: msg.video_urls,
             reasoning_content: msg.reasoning_content,
             final_content: msg.final_content,
+            tool_traces: msg.tool_traces,
           }));
           setMessages(historyMessages);
           setIsBackendAvailable(true);
@@ -718,8 +724,11 @@ export function ChatBox({
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     setStreamingAssistantIndex(assistantIndex);
     setStreamingAssistantContent("");
+    setStreamingAssistantReasoning("");
+    setStreamingToolTraces([]);
     setStreamingThinkingPanelLocked(Boolean(modeConfig?.supports_thinking ? enableThinkingMode : false));
     streamBufferRef.current = "";
+    reasoningBufferRef.current = "";
     lastStreamFlushAtRef.current = 0;
 
     try {
@@ -824,6 +833,17 @@ export function ChatBox({
         (done) => {
           streamResult.done = done;
         },
+        (reasoningToken) => {
+          reasoningBufferRef.current += reasoningToken;
+          const now = Date.now();
+          if (now - lastStreamFlushAtRef.current >= STREAM_FLUSH_INTERVAL_MS) {
+            lastStreamFlushAtRef.current = now;
+            setStreamingAssistantReasoning(reasoningBufferRef.current);
+          }
+        },
+        (trace) => {
+          setStreamingToolTraces((prev) => [...prev, trace]);
+        },
         uploadedImageIds.length > 1 ? uploadedImageIds : undefined,
         uploadedAudioUrl,
         undefined,
@@ -835,6 +855,7 @@ export function ChatBox({
         if (now - lastStreamFlushAtRef.current >= STREAM_FLUSH_INTERVAL_MS) {
           lastStreamFlushAtRef.current = now;
           setStreamingAssistantContent(streamBufferRef.current);
+          setStreamingAssistantReasoning(reasoningBufferRef.current);
         }
       }
 
@@ -842,6 +863,9 @@ export function ChatBox({
       const doneDisplayContent = (streamResult.done?.display_content || "").trim();
       const doneReasoningContent = (streamResult.done?.reasoning_content || "").trim();
       const doneFinalContent = (streamResult.done?.final_content || "").trim();
+      const doneToolTraces = Array.isArray(streamResult.done?.tool_traces)
+        ? streamResult.done?.tool_traces || []
+        : [];
 
       let reasoningContent = doneReasoningContent || undefined;
       let finalContent = doneFinalContent || doneDisplayContent || rawFullContent;
@@ -869,6 +893,7 @@ export function ChatBox({
         displayContent = finalContent || rawFullContent;
       }
       setStreamingAssistantContent(fullResponse);
+      setStreamingAssistantReasoning(reasoningContent || reasoningBufferRef.current || "");
       setMessages((prev) => {
         const newMessages = [...prev];
         const fallbackIndex = newMessages
@@ -884,6 +909,7 @@ export function ChatBox({
             content: displayContent,
             reasoning_content: reasoningContent,
             final_content: finalContent,
+            tool_traces: doneToolTraces.length ? doneToolTraces : (streamingToolTraces.length ? streamingToolTraces : undefined),
           };
         }
         return newMessages;
@@ -920,6 +946,8 @@ export function ChatBox({
       setIsLoading(false);
       setStreamingAssistantIndex(null);
       setStreamingAssistantContent("");
+      setStreamingAssistantReasoning("");
+      setStreamingToolTraces([]);
       setStreamingThinkingPanelLocked(false);
       if (textareaRef.current) {
         textareaRef.current.focus();
@@ -939,10 +967,31 @@ export function ChatBox({
       return;
     }
 
-    const allowed = new Set(["txt", "md", "markdown", "pdf", "csv", "json", "log"]);
+    const allowedTextExtensions = new Set(["txt", "md", "markdown", "pdf", "csv", "json", "log"]);
+    const allowedAudioExtensions = new Set(["mp3"]);
     const ext = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() || "" : "";
-    if (!allowed.has(ext)) {
-      alert("暂仅支持 txt/md/pdf/csv/json/log 文件");
+    const isAudioFile = file.type.startsWith("audio/") || allowedAudioExtensions.has(ext);
+
+    if (isAudioFile) {
+      if (modeConfig?.supports_audio === false) {
+        alert(`当前档位 ${modeConfig.deploy_profile} 不支持音频输入`);
+        return;
+      }
+      if (file.size > 32 * 1024 * 1024) {
+        alert("音频大小不能超过 32MB");
+        return;
+      }
+      clearSelectedFile();
+      setShouldAutoSubmitRecordedAudio(false);
+      setSelectedAudioFromFile(file);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return;
+    }
+
+    if (!allowedTextExtensions.has(ext)) {
+      alert("暂仅支持 txt/md/pdf/csv/json/log 文件，或 mp3 音频");
       return;
     }
 
@@ -1026,6 +1075,26 @@ export function ChatBox({
     modeConfig?.deploy_profile && modeConfig.deploy_profile in PROFILE_GUIDE
       ? PROFILE_GUIDE[modeConfig.deploy_profile as DeployProfileKey]
       : null;
+
+  const formatTraceJson = (value: unknown): string => {
+    if (typeof value === "string") {
+      const text = value.trim();
+      if (!text) return "";
+      try {
+        return JSON.stringify(JSON.parse(text), null, 2);
+      } catch {
+        return text;
+      }
+    }
+    if (value === undefined || value === null) {
+      return "";
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
 
   const imageUploadDisabledReason = !isBackendAvailable
     ? "后端服务未连接"
@@ -1221,14 +1290,56 @@ export function ChatBox({
                         {(() => {
                           const isStreamingMessage = isLoading && streamingAssistantIndex === idx;
                           const contentToRender = isStreamingMessage ? streamingAssistantContent : msg.content;
+                          const traces = isStreamingMessage ? streamingToolTraces : (msg.tool_traces || []);
                           return (
-                            <AssistantContent
-                              content={contentToRender || ""}
-                              isStreaming={isStreamingMessage}
-                              reasoningContent={msg.reasoning_content}
-                              finalContent={msg.final_content}
-                              preferThinkingPanel={isStreamingMessage && streamingThinkingPanelLocked}
-                            />
+                            <div className="space-y-3">
+                              <AssistantContent
+                                content={contentToRender || ""}
+                                isStreaming={isStreamingMessage}
+                                reasoningContent={isStreamingMessage ? streamingAssistantReasoning : msg.reasoning_content}
+                                finalContent={isStreamingMessage ? streamingAssistantContent : msg.final_content}
+                                preferThinkingPanel={isStreamingMessage && streamingThinkingPanelLocked}
+                              />
+                              {Array.isArray(traces) && traces.length > 0 && (
+                                <details className="rounded-lg border border-border/80 bg-muted/20 px-3 py-2">
+                                  <summary className="cursor-pointer list-none text-xs text-muted-foreground flex items-center gap-1.5">
+                                    <Wrench className="w-3.5 h-3.5" />
+                                    <span>工具执行轨迹（{traces.length}）</span>
+                                  </summary>
+                                  <div className="mt-2 space-y-2">
+                                    {traces.map((trace, traceIndex) => {
+                                      const name = String(trace?.name || "unknown_tool");
+                                      const elapsedMs = Number(trace?.elapsed_ms || 0);
+                                      const argText = formatTraceJson(trace?.arguments);
+                                      const outText = formatTraceJson(trace?.output);
+                                      return (
+                                        <div
+                                          key={`${name}-${traceIndex}`}
+                                          className="rounded-md border border-border/70 bg-background/60 p-2 text-xs space-y-1.5"
+                                        >
+                                          <div className="flex items-center justify-between gap-2">
+                                            <span className="font-medium text-foreground">{name}</span>
+                                            {elapsedMs > 0 && (
+                                              <span className="text-muted-foreground">{elapsedMs.toFixed(1)} ms</span>
+                                            )}
+                                          </div>
+                                          {argText && (
+                                            <pre className="whitespace-pre-wrap break-words text-[11px] leading-relaxed bg-muted/40 rounded p-2 overflow-x-auto">
+                                              {argText}
+                                            </pre>
+                                          )}
+                                          {outText && (
+                                            <pre className="whitespace-pre-wrap break-words text-[11px] leading-relaxed bg-muted/40 rounded p-2 overflow-x-auto">
+                                              {outText}
+                                            </pre>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </details>
+                              )}
+                            </div>
                           );
                         })()}
                       </div>
@@ -1383,7 +1494,7 @@ export function ChatBox({
           <input
             ref={fileInputRef}
             type="file"
-            accept=".txt,.md,.markdown,.pdf,.csv,.json,.log"
+            accept=".txt,.md,.markdown,.pdf,.csv,.json,.log,.mp3,audio/mpeg"
             className="hidden"
             disabled={isLoading || !isBackendAvailable}
             onChange={(e) => handleSelectFile(e.target.files?.[0] || null)}
@@ -1433,7 +1544,7 @@ export function ChatBox({
                   "h-12 w-12 rounded-2xl shadow-sm",
                   selectedFileData && "border-primary text-primary"
                 )}
-                title="上传文件附件"
+                title="上传文件附件（支持 mp3 自动音频分析）"
               >
                 <Paperclip className="w-5 h-5" />
               </Button>

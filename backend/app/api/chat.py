@@ -8,6 +8,8 @@ import json
 import re
 import logging
 import mimetypes
+import shutil
+import subprocess
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,8 +31,8 @@ from app.models.schema import (
     ChatVideoUploadResponse,
 )
 from app.services.llm_service import (
-    generate_response,
-    astream_response,
+    generate_response_structured,
+    astream_response_events,
     is_model_loaded,
     get_llm,
     get_active_model_name,
@@ -60,7 +62,6 @@ from app.services.chat_audio_service import (
     persist_uploaded_chat_audio,
     get_chat_audio_file,
     resolve_chat_audio_id_from_url,
-    resolve_chat_audio_data_url,
 )
 from app.services.chat_video_service import (
     persist_uploaded_chat_video,
@@ -80,6 +81,7 @@ VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
         "supports_video": False,
         "supports_thinking": True,
         "supports_tool_calling": False,
+        "supports_structured_output": True,
     },
     "vision": {
         "supports_image": True,
@@ -87,6 +89,7 @@ VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
         "supports_video": False,
         "supports_thinking": True,
         "supports_tool_calling": False,
+        "supports_structured_output": True,
     },
     "full": {
         "supports_image": True,
@@ -94,6 +97,7 @@ VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
         "supports_video": True,
         "supports_thinking": True,
         "supports_tool_calling": True,
+        "supports_structured_output": True,
     },
     "full_featured": {
         "supports_image": True,
@@ -101,6 +105,7 @@ VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
         "supports_video": True,
         "supports_thinking": True,
         "supports_tool_calling": True,
+        "supports_structured_output": True,
     },
     "benchmark": {
         "supports_image": False,
@@ -108,6 +113,7 @@ VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
         "supports_video": False,
         "supports_thinking": False,
         "supports_tool_calling": False,
+        "supports_structured_output": True,
     },
     "extreme": {
         "supports_image": False,
@@ -115,7 +121,22 @@ VLLM_PROFILE_CAPABILITIES: dict[str, dict[str, bool]] = {
         "supports_video": False,
         "supports_thinking": False,
         "supports_tool_calling": False,
+        "supports_structured_output": True,
     },
+}
+
+_AUDIO_MIME_BY_EXTENSION: dict[str, str] = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "ogg": "audio/ogg",
+    "webm": "audio/webm",
+    "m4a": "audio/mp4",
+    "mp4": "audio/mp4",
+    "flac": "audio/flac",
+}
+_AUDIO_GUESS_EXTENSION_ALIAS: dict[str, str] = {
+    "oga": "ogg",
+    "mpga": "mp3",
 }
 
 def _normalize_profile(profile: str | None) -> str | None:
@@ -162,6 +183,7 @@ def _current_mode_config(request_profile: str | None = None) -> dict[str, object
             "supports_video": False,
             "supports_thinking": False,
             "supports_tool_calling": False,
+            "supports_structured_output": False,
             "available_profiles": [],
             "configured_profile": None,
             "runtime_profile_override": None,
@@ -181,17 +203,26 @@ def _current_mode_config(request_profile: str | None = None) -> dict[str, object
     }
 
 
-def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], dict[str, object]]:
-    """Resolve effective thinking/tool flags under current deploy profile."""
+def _resolve_mode_flags(
+    request: ChatRequest,
+    *,
+    has_image_input: bool | None = None,
+    has_audio_input: bool | None = None,
+    has_video_input: bool | None = None,
+) -> tuple[bool, bool, bool, list[str], dict[str, object]]:
+    """Resolve effective request flags under current deploy profile."""
     mode_config = _current_mode_config(request.deploy_profile)
     supports_thinking = bool(mode_config.get("supports_thinking", False))
     supports_tool_calling = bool(mode_config.get("supports_tool_calling", False))
+    supports_structured_output = bool(mode_config.get("supports_structured_output", False))
 
     _, _, profile_warnings = _resolve_effective_profile(request.deploy_profile)
     warnings: list[str] = [str(item) for item in profile_warnings if str(item).strip()]
 
     effective_thinking = bool(request.enable_thinking and supports_thinking)
     effective_tool_calling = bool(request.enable_tool_calling and supports_tool_calling)
+    has_structured_output = bool(request.response_format is not None)
+    effective_structured_output = bool(has_structured_output and supports_structured_output)
 
     if request.enable_thinking and not effective_thinking:
         warnings.append(
@@ -201,22 +232,41 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
         warnings.append(
             f"Tool calling requested but disabled by deploy profile '{mode_config['deploy_profile']}'"
         )
+    if has_structured_output and settings.LLM_PROVIDER != "vllm":
+        raise HTTPException(
+            status_code=400,
+            detail="response_format is only supported when LLM_PROVIDER=vllm",
+        )
+    if has_structured_output and settings.LLM_PROVIDER == "vllm" and not effective_structured_output:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Current deploy profile '{mode_config['deploy_profile']}' does not support structured output."
+            ),
+        )
 
-    has_image_input = bool(
+    resolved_has_image_input = bool(
         (request.image and request.image.strip())
         or (request.image_id and request.image_id.strip())
         or (request.images and any(item and item.strip() for item in request.images))
         or (request.image_ids and any(item and item.strip() for item in request.image_ids))
     )
-    has_audio_input = bool(
+    resolved_has_audio_input = bool(
         (request.audio_url and request.audio_url.strip())
         or (request.audio_urls and any(item and item.strip() for item in request.audio_urls))
     )
-    has_video_input = bool(
+    resolved_has_video_input = bool(
         (request.video_url and request.video_url.strip())
         or (request.video_urls and any(item and item.strip() for item in request.video_urls))
     )
-    if has_image_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_image", False)):
+    if has_image_input is not None:
+        resolved_has_image_input = bool(has_image_input)
+    if has_audio_input is not None:
+        resolved_has_audio_input = bool(has_audio_input)
+    if has_video_input is not None:
+        resolved_has_video_input = bool(has_video_input)
+
+    if resolved_has_image_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_image", False)):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -224,7 +274,7 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
                 "Please use a server startup profile that supports images (recommended: full_featured)."
             ),
         )
-    if has_audio_input and settings.LLM_PROVIDER != "vllm":
+    if resolved_has_audio_input and settings.LLM_PROVIDER != "vllm":
         raise HTTPException(
             status_code=400,
             detail=(
@@ -232,7 +282,7 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
                 "Please switch to vLLM (Gemma4 E2B/E4B with audio support)."
             ),
         )
-    if has_audio_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_audio", False)):
+    if resolved_has_audio_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_audio", False)):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -240,7 +290,7 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
                 "Please use a server startup profile that supports audio (recommended: full/full_featured)."
             ),
         )
-    if has_video_input and settings.LLM_PROVIDER != "vllm":
+    if resolved_has_video_input and settings.LLM_PROVIDER != "vllm":
         raise HTTPException(
             status_code=400,
             detail=(
@@ -248,7 +298,7 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
                 "Please switch to vLLM (Gemma4 E2B/E4B with video support)."
             ),
         )
-    if has_video_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_video", False)):
+    if resolved_has_video_input and settings.LLM_PROVIDER == "vllm" and not bool(mode_config.get("supports_video", False)):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -257,7 +307,7 @@ def _resolve_mode_flags(request: ChatRequest) -> tuple[bool, bool, list[str], di
             ),
         )
 
-    return effective_thinking, effective_tool_calling, warnings, mode_config
+    return effective_thinking, effective_tool_calling, effective_structured_output, warnings, mode_config
 
 
 def _resolve_generation_overrides(request: ChatRequest) -> tuple[int, float, float]:
@@ -323,6 +373,136 @@ def _allowed_chat_file_extensions() -> set[str]:
         if ext:
             values.add(ext)
     return values
+
+
+def _allowed_chat_audio_extensions() -> set[str]:
+    """Allowed audio extensions for multimodal chat input."""
+    values: set[str] = set()
+    for item in settings.CHAT_AUDIO_ALLOWED_EXTENSIONS.split(","):
+        ext = item.strip().lower().lstrip(".")
+        if ext:
+            values.add(ext)
+    return values
+
+
+def _resolve_audio_mime_from_extension(extension: str | None) -> str:
+    """Resolve best-effort audio MIME type for a known extension."""
+    normalized = (extension or "").lower().lstrip(".")
+    if normalized in _AUDIO_MIME_BY_EXTENSION:
+        return _AUDIO_MIME_BY_EXTENSION[normalized]
+    guessed, _ = mimetypes.guess_type(f"audio.{normalized}")
+    if guessed and guessed.startswith("audio/"):
+        return guessed
+    return "audio/wav"
+
+
+def _normalize_audio_for_vllm(audio_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
+    """Normalize audio payload for vLLM input; optionally transcode to wav."""
+    if not audio_bytes:
+        return audio_bytes, mime_type
+
+    normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower() or "audio/wav"
+    if not settings.CHAT_AUDIO_TRANSCODE_TO_WAV:
+        return audio_bytes, normalized_mime
+    if normalized_mime in {"audio/wav", "audio/x-wav"}:
+        return audio_bytes, "audio/wav"
+
+    ffmpeg_bin = shutil.which(settings.FFMPEG_BINARY or "ffmpeg")
+    if not ffmpeg_bin:
+        logger.warning(
+            "FFmpeg not found (%s), skip audio transcode and keep mime=%s",
+            settings.FFMPEG_BINARY,
+            normalized_mime,
+        )
+        return audio_bytes, normalized_mime
+
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        "pipe:0",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            input=audio_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=settings.AUDIO_TRANSCODE_TIMEOUT_SECONDS,
+        )
+        if result.stdout:
+            return result.stdout, "audio/wav"
+    except Exception as exc:
+        logger.warning("Audio transcode to wav failed, keep original audio: %s", exc)
+
+    return audio_bytes, normalized_mime
+
+
+def _resolve_audio_from_file_attachment(
+    file_data: str | None,
+    file_name: str | None,
+    file_format: str | None,
+) -> tuple[str | None, str | None]:
+    """Convert audio file attachment payload into data URL for Gemma4 audio path."""
+    if not file_data:
+        return None, None
+
+    payload = _extract_file_payload(file_data)
+    resolved_format = _resolve_file_format(
+        file_name=file_name,
+        file_data=file_data,
+        file_format=file_format,
+    )
+    normalized_format = (resolved_format or "").lower().lstrip(".")
+    is_audio_data_url = file_data.startswith("data:audio/")
+    audio_allowed = _allowed_chat_audio_extensions()
+
+    if not is_audio_data_url and (not normalized_format or normalized_format not in audio_allowed):
+        return None, normalized_format or None
+
+    try:
+        raw_bytes = base64.b64decode(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"音频文件 base64 解码失败: {exc}") from exc
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="audio file is empty")
+
+    max_bytes = settings.MAX_CHAT_AUDIO_UPLOAD_MB * 1024 * 1024
+    if len(raw_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"audio file too large ({len(raw_bytes) / 1024 / 1024:.2f}MB), "
+                f"limit {settings.MAX_CHAT_AUDIO_UPLOAD_MB}MB"
+            ),
+        )
+
+    mime_type = _resolve_audio_mime_from_extension(normalized_format or None)
+    if is_audio_data_url:
+        header = file_data.split(",", 1)[0]
+        match = re.match(r"^data:(audio/[a-zA-Z0-9+.-]+);base64$", header, flags=re.IGNORECASE)
+        if match:
+            mime_type = match.group(1).lower()
+        if not normalized_format:
+            guessed_ext = mimetypes.guess_extension(mime_type) or ""
+            normalized_guess = guessed_ext.lstrip(".").lower()
+            normalized_format = _AUDIO_GUESS_EXTENSION_ALIAS.get(normalized_guess, normalized_guess)
+
+    normalized_bytes, normalized_mime = _normalize_audio_for_vllm(raw_bytes, mime_type)
+    encoded = base64.b64encode(normalized_bytes).decode("ascii")
+    return f"data:{normalized_mime};base64,{encoded}", normalized_format or None
 
 
 def _enforce_image_payload_limit(image_data: str | None) -> None:
@@ -445,11 +625,27 @@ def _infer_audio_mime_type(audio_url: str, content_type: str | None) -> str:
 async def _fetch_audio_url_as_data_url(audio_url: str) -> str:
     """Resolve audio URL to data URL for vLLM audio blocks."""
     if _is_data_audio_url(audio_url):
-        return audio_url
+        payload = audio_url.split(",", 1)[1] if "," in audio_url else ""
+        try:
+            raw_bytes = base64.b64decode(payload)
+        except Exception:
+            return audio_url
+        header = audio_url.split(",", 1)[0]
+        match = re.match(r"^data:(audio/[a-zA-Z0-9+.-]+);base64$", header, flags=re.IGNORECASE)
+        mime_type = match.group(1).lower() if match else "audio/wav"
+        normalized_bytes, normalized_mime = _normalize_audio_for_vllm(raw_bytes, mime_type)
+        if normalized_bytes == raw_bytes and normalized_mime == mime_type:
+            return audio_url
+        encoded = base64.b64encode(normalized_bytes).decode("ascii")
+        return f"data:{normalized_mime};base64,{encoded}"
 
     local_audio_id = resolve_chat_audio_id_from_url(audio_url)
     if local_audio_id:
-        return resolve_chat_audio_data_url(local_audio_id)
+        audio_path, media_type = get_chat_audio_file(local_audio_id)
+        raw_bytes = audio_path.read_bytes()
+        normalized_bytes, normalized_mime = _normalize_audio_for_vllm(raw_bytes, media_type)
+        encoded = base64.b64encode(normalized_bytes).decode("ascii")
+        return f"data:{normalized_mime};base64,{encoded}"
 
     parsed = urlparse(audio_url)
     if parsed.scheme not in {"http", "https"}:
@@ -483,8 +679,9 @@ async def _fetch_audio_url_as_data_url(audio_url: str) -> str:
     except Exception as exc:
         raise RuntimeError(f"prefetch audio failed for '{audio_url}': {exc}") from exc
 
-    encoded = base64.b64encode(audio_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+    normalized_bytes, normalized_mime = _normalize_audio_for_vllm(audio_bytes, mime_type)
+    encoded = base64.b64encode(normalized_bytes).decode("ascii")
+    return f"data:{normalized_mime};base64,{encoded}"
 
 
 async def _prepare_audio_urls_for_vllm(audio_urls: list[str]) -> tuple[list[str], list[str]]:
@@ -1001,12 +1198,32 @@ async def chat(request: ChatRequest) -> ChatResponse:
     resolved_audio_urls = _resolve_audio_inputs(request)
     resolved_video_urls = _resolve_video_inputs(request)
     inline_image_payloads, inline_image_formats = _resolve_inline_image_inputs(request)
-    file_context, resolved_file_format = _build_file_context(
+    file_audio_data_url, file_audio_format = _resolve_audio_from_file_attachment(
         file_data=request.file,
         file_name=request.file_name,
         file_format=request.file_format,
     )
-    effective_thinking, effective_tool_calling, mode_warnings, mode_config = _resolve_mode_flags(request)
+    is_audio_file_attachment = bool(file_audio_data_url)
+
+    if file_audio_data_url and file_audio_data_url not in resolved_audio_urls:
+        resolved_audio_urls.append(file_audio_data_url)
+
+    if is_audio_file_attachment:
+        file_context = ""
+        resolved_file_format = file_audio_format
+    else:
+        file_context, resolved_file_format = _build_file_context(
+            file_data=request.file,
+            file_name=request.file_name,
+            file_format=request.file_format,
+        )
+
+    effective_thinking, effective_tool_calling, effective_structured_output, mode_warnings, mode_config = _resolve_mode_flags(
+        request,
+        has_image_input=bool(resolved_image_payloads),
+        has_audio_input=bool(resolved_audio_urls),
+        has_video_input=bool(resolved_video_urls),
+    )
     effective_max_tokens, effective_temperature, effective_top_p = _resolve_generation_overrides(request)
     vllm_audio_urls = list(resolved_audio_urls)
     vllm_video_urls = list(resolved_video_urls)
@@ -1041,6 +1258,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         or (inline_image_formats[0] if inline_image_formats else None)
         or request.image_format
     )
+    has_file_attachment = bool(request.file and not is_audio_file_attachment)
     add_message(
         session_id,
         "user",
@@ -1050,9 +1268,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
         image_format=image_format_to_store,
         image_id=primary_image_id,
         image_ids=cached_image_ids or None,
-        has_file=bool(request.file),
-        file_name=request.file_name,
-        file_format=resolved_file_format,
+        has_file=has_file_attachment,
+        file_name=request.file_name if has_file_attachment else None,
+        file_format=resolved_file_format if has_file_attachment else None,
         has_audio=bool(resolved_audio_urls),
         audio_url=resolved_audio_urls[0] if resolved_audio_urls else None,
         audio_urls=resolved_audio_urls or None,
@@ -1073,7 +1291,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     use_native_vllm_image = settings.LLM_PROVIDER == "vllm" and bool(resolved_image_payloads)
     image_context = ""
     has_image = bool(resolved_image_payloads)
-    has_file = bool(request.file)
+    has_file = has_file_attachment
     has_audio = bool(resolved_audio_urls)
     has_video = bool(resolved_video_urls)
     audio_prefetched_count = sum(
@@ -1090,7 +1308,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     # Generate response (hybrid mode: use RAG when available, free chat otherwise)
     try:
-        response_text = generate_response(
+        response_payload = generate_response_structured(
             question=request.message,
             context=combined_context,
             image_data=resolved_image_payloads[0] if use_native_vllm_multimodal and resolved_image_payloads else None,
@@ -1119,6 +1337,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             ),
             enable_thinking=effective_thinking,
             enable_tool_calling=effective_tool_calling,
+            response_format=request.response_format if effective_structured_output else None,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
@@ -1126,11 +1345,25 @@ async def chat(request: ChatRequest) -> ChatResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
-    reasoning_content, final_content = _split_reasoning_final_content(
-        response_text,
-        enable_thinking=effective_thinking,
-    )
-    display_content = final_content or response_text.strip() or response_text
+    raw_reasoning = str(response_payload.get("reasoning_content") or "").strip()
+    raw_final = str(response_payload.get("final_content") or "").strip()
+    tool_traces = response_payload.get("tool_traces") or []
+    if not isinstance(tool_traces, list):
+        tool_traces = []
+
+    reasoning_content = raw_reasoning or None
+    final_content = raw_final
+
+    # Backward compatibility fallback: if upstream returns merged thought text, split it.
+    if effective_thinking and not reasoning_content and re.match(r"^thought\s*", raw_final, flags=re.IGNORECASE):
+        fallback_reasoning, fallback_final = _split_reasoning_final_content(
+            raw_final,
+            enable_thinking=True,
+        )
+        reasoning_content = fallback_reasoning
+        final_content = fallback_final or raw_final
+
+    display_content = final_content or raw_final or (reasoning_content or "")
 
     # Add assistant message to history
     add_message(
@@ -1139,6 +1372,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         display_content,
         reasoning_content=reasoning_content,
         final_content=final_content or display_content,
+        tool_traces=tool_traces or None,
     )
 
     return ChatResponse(
@@ -1174,8 +1408,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "profile_source": mode_config.get("profile_source"),
             "enable_thinking": effective_thinking,
             "enable_tool_calling": effective_tool_calling,
+            "enable_structured_output": effective_structured_output,
             "requested_enable_thinking": request.enable_thinking,
             "requested_enable_tool_calling": request.enable_tool_calling,
+            "requested_structured_output": bool(request.response_format),
+            "response_format_type": request.response_format.get("type") if request.response_format else None,
+            "response_schema_name": (
+                (request.response_format.get("json_schema") or {}).get("name")
+                if request.response_format
+                else None
+            ),
             "mode_warnings": mode_warnings,
             "requested_max_tokens": request.max_tokens,
             "effective_max_tokens": effective_max_tokens,
@@ -1183,6 +1425,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "effective_top_p": effective_top_p,
             "reasoning_content": reasoning_content,
             "final_content": final_content or display_content,
+            "tool_traces": tool_traces,
+            "tool_trace_count": len(tool_traces),
         },
     )
 
@@ -1210,12 +1454,32 @@ async def chat_stream(request: ChatRequest):
     resolved_audio_urls = _resolve_audio_inputs(request)
     resolved_video_urls = _resolve_video_inputs(request)
     inline_image_payloads, inline_image_formats = _resolve_inline_image_inputs(request)
-    file_context, resolved_file_format = _build_file_context(
+    file_audio_data_url, file_audio_format = _resolve_audio_from_file_attachment(
         file_data=request.file,
         file_name=request.file_name,
         file_format=request.file_format,
     )
-    effective_thinking, effective_tool_calling, mode_warnings, mode_config = _resolve_mode_flags(request)
+    is_audio_file_attachment = bool(file_audio_data_url)
+
+    if file_audio_data_url and file_audio_data_url not in resolved_audio_urls:
+        resolved_audio_urls.append(file_audio_data_url)
+
+    if is_audio_file_attachment:
+        file_context = ""
+        resolved_file_format = file_audio_format
+    else:
+        file_context, resolved_file_format = _build_file_context(
+            file_data=request.file,
+            file_name=request.file_name,
+            file_format=request.file_format,
+        )
+
+    effective_thinking, effective_tool_calling, effective_structured_output, mode_warnings, mode_config = _resolve_mode_flags(
+        request,
+        has_image_input=bool(resolved_image_payloads),
+        has_audio_input=bool(resolved_audio_urls),
+        has_video_input=bool(resolved_video_urls),
+    )
     effective_max_tokens, effective_temperature, effective_top_p = _resolve_generation_overrides(request)
     vllm_audio_urls = list(resolved_audio_urls)
     vllm_video_urls = list(resolved_video_urls)
@@ -1251,7 +1515,7 @@ async def chat_stream(request: ChatRequest):
     has_image = bool(resolved_image_payloads)
     has_audio = bool(resolved_audio_urls)
     has_video = bool(resolved_video_urls)
-    has_file = bool(request.file)
+    has_file = bool(request.file and not is_audio_file_attachment)
     audio_prefetched_count = sum(
         1 for raw, prepared in zip(resolved_audio_urls, vllm_audio_urls) if raw != prepared
     )
@@ -1262,6 +1526,7 @@ async def chat_stream(request: ChatRequest):
         or (inline_image_formats[0] if inline_image_formats else None)
         or request.image_format
     )
+    has_file_attachment = has_file
 
     logger.info(
         "chat_stream request: session=%s msg_len=%d image_count=%d audio_count=%d video_count=%d has_file=%s image_chars=%d file_chars=%d provider=%s native_vllm_mm=%s image_format=%s",
@@ -1295,9 +1560,9 @@ async def chat_stream(request: ChatRequest):
         image_format=image_format_to_store,
         image_id=primary_image_id,
         image_ids=cached_image_ids or None,
-        has_file=has_file,
-        file_name=request.file_name,
-        file_format=resolved_file_format,
+        has_file=has_file_attachment,
+        file_name=request.file_name if has_file_attachment else None,
+        file_format=resolved_file_format if has_file_attachment else None,
         has_audio=has_audio,
         audio_url=resolved_audio_urls[0] if resolved_audio_urls else None,
         audio_urls=resolved_audio_urls or None,
@@ -1349,8 +1614,16 @@ async def chat_stream(request: ChatRequest):
                     "profile_source": mode_config.get("profile_source"),
                     "enable_thinking": effective_thinking,
                     "enable_tool_calling": effective_tool_calling,
+                    "enable_structured_output": effective_structured_output,
                     "requested_enable_thinking": request.enable_thinking,
                     "requested_enable_tool_calling": request.enable_tool_calling,
+                    "requested_structured_output": bool(request.response_format),
+                    "response_format_type": request.response_format.get("type") if request.response_format else None,
+                    "response_schema_name": (
+                        (request.response_format.get("json_schema") or {}).get("name")
+                        if request.response_format
+                        else None
+                    ),
                     "mode_warnings": mode_warnings,
                     "requested_max_tokens": request.max_tokens,
                     "effective_max_tokens": effective_max_tokens,
@@ -1360,9 +1633,11 @@ async def chat_stream(request: ChatRequest):
             }
 
             # Stream response (hybrid mode: use combined context when available)
-            full_response = ""
+            full_reasoning = ""
+            full_answer = ""
+            tool_traces: list[dict] = []
             effective_question = request.message
-            async for token in astream_response(
+            async for event in astream_response_events(
                 question=effective_question,
                 context=combined_context,
                 image_data=(
@@ -1399,31 +1674,71 @@ async def chat_stream(request: ChatRequest):
                 ),
                 enable_thinking=effective_thinking,
                 enable_tool_calling=effective_tool_calling,
+                response_format=request.response_format if effective_structured_output else None,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
                 top_p=request.top_p,
             ):
-                full_response += token
+                token_type = str(event.get("type") or "answer").strip().lower()
+                if token_type == "tool_trace":
+                    trace_obj = event.get("trace")
+                    if isinstance(trace_obj, dict):
+                        tool_traces.append(trace_obj)
+                        yield {
+                            "event": "tool_trace",
+                            "data": json.dumps({"trace": trace_obj}, ensure_ascii=False),
+                        }
+                    continue
+
+                token = str(event.get("token") or "")
+                if not token:
+                    continue
+
+                if token_type == "reasoning":
+                    full_reasoning += token
+                    yield {
+                        "event": "reasoning",
+                        "data": json.dumps({"token": token}),
+                    }
+                    continue
+
+                full_answer += token
                 yield {
                     "event": "token",
                     "data": json.dumps({"token": token}),
                 }
 
-            reasoning_content, final_content = _split_reasoning_final_content(
-                full_response,
-                enable_thinking=effective_thinking,
-            )
-            display_content = final_content or full_response.strip() or full_response
+            reasoning_content = full_reasoning.strip() or None
+            final_content = full_answer.strip()
+
+            # Backward compatibility fallback: if upstream returns merged thought text in answer channel, split it.
+            if effective_thinking and not reasoning_content and re.match(r"^thought\s*", final_content, flags=re.IGNORECASE):
+                fallback_reasoning, fallback_final = _split_reasoning_final_content(
+                    final_content,
+                    enable_thinking=True,
+                )
+                reasoning_content = fallback_reasoning
+                final_content = fallback_final or final_content
+
+            display_content = final_content or (reasoning_content or "")
+            if reasoning_content and final_content:
+                full_content = f"thought {reasoning_content}\n\nFinal answer:\n{final_content}"
+            elif reasoning_content:
+                full_content = f"thought {reasoning_content}"
+            else:
+                full_content = final_content
 
             # Send completion event
             yield {
                 "event": "done",
                 "data": json.dumps({
                     "session_id": session_id,
-                    "full_content": full_response,
+                    "full_content": full_content,
                     "reasoning_content": reasoning_content,
                     "final_content": final_content or display_content,
                     "display_content": display_content,
+                    "tool_traces": tool_traces,
+                    "tool_trace_count": len(tool_traces),
                 }),
             }
 
@@ -1434,6 +1749,7 @@ async def chat_stream(request: ChatRequest):
                 display_content,
                 reasoning_content=reasoning_content,
                 final_content=final_content or display_content,
+                tool_traces=tool_traces or None,
             )
 
         except Exception as e:

@@ -21,6 +21,16 @@ export interface ChatMessage {
   video_urls?: string[];
   reasoning_content?: string;
   final_content?: string;
+  tool_traces?: ToolTrace[];
+}
+
+export interface ToolTrace {
+  id?: string;
+  name?: string;
+  arguments?: string;
+  output?: string;
+  elapsed_ms?: number;
+  ts?: string;
 }
 
 export interface SourceDocument {
@@ -57,11 +67,17 @@ export interface ChatResponse {
     profile_source?: string;
     enable_thinking?: boolean;
     enable_tool_calling?: boolean;
+    enable_structured_output?: boolean;
     requested_enable_thinking?: boolean;
     requested_enable_tool_calling?: boolean;
+    requested_structured_output?: boolean;
+    response_format_type?: string;
+    response_schema_name?: string;
     mode_warnings?: string[];
     reasoning_content?: string;
     final_content?: string;
+    tool_traces?: ToolTrace[];
+    tool_trace_count?: number;
   };
 }
 
@@ -166,6 +182,7 @@ export interface ChatModeConfigResponse {
   supports_video: boolean;
   supports_thinking: boolean;
   supports_tool_calling: boolean;
+  supports_structured_output: boolean;
   available_profiles: string[];
   configured_profile?: string | null;
   runtime_profile_override?: string | null;

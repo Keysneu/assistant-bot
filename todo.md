@@ -817,3 +817,358 @@
 - 验证：
   - 本机验证 `curl --ipv4 http://localhost:8000/api/health/` 返回 200。
   - 本机验证 `curl --ipv6 http://localhost:8000/api/health/` 为空响应（复现歧义场景）。
+
+## 51. 2026-04-06 Gemma4 Thinking 官方结构化接入（reasoning_content / SSE reasoning）
+
+- 目标：
+  - 对齐官方 Gemma4 thinking 模式：`extra_body.chat_template_kwargs.enable_thinking=true` 下，优先消费 `reasoning_content` 字段，不再依赖拼接文本解析。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 新增 `generate_response_structured()`：返回 `reasoning_content` 与 `final_content`。
+    - vLLM 调用链改为结构化提取 `reasoning_content/content`，工具调用路径同样返回结构化结果。
+    - 新增 `stream_response_events()/astream_response_events()`：流式按事件区分 `reasoning` 与 `answer` token。
+    - 保留原 `generate_response/stream_response/astream_response` 兼容层（旧调用仍可工作）。
+  - `backend/app/api/chat.py`
+    - 非流式 `POST /api/chat/` 改为使用结构化返回并落库 `reasoning_content/final_content`。
+    - 流式 `POST /api/chat/stream` 新增 SSE `reasoning` 事件；`token` 事件专用于最终回答 token。
+    - `done` 事件稳定返回：`full_content`、`reasoning_content`、`final_content`、`display_content`。
+    - 保留旧 `thought ... Final answer` 文本的兼容分割兜底。
+  - `frontend/src/lib/api.ts`
+    - `streamMessage()` 新增 `onReasoningToken` 回调，消费 `reasoning` SSE 事件。
+  - `frontend/src/components/ChatBox.tsx`
+    - 新增实时 `streamingAssistantReasoning` 状态，流式阶段思考内容进入“思考过程”面板实时渲染。
+    - 最终态优先使用后端结构化字段，保留旧格式兼容解析兜底。
+  - 文档同步：
+    - `README.md` “最新进展”新增本项接入说明。
+- 验证：
+  - `python3 -m py_compile backend/app/services/llm_service.py backend/app/api/chat.py backend/app/models/schema.py` 通过。
+  - `cd frontend && npm run test -- thinkingParser` 通过（8/8）。
+  - `cd frontend && npm run build` 失败原因不变：历史 TS6133（`SessionList.tsx`、`ui/Dialog.tsx`），与本次改动无直接关系。
+
+## 52. 2026-04-06 Gemma4 Tool Calling 官方链路增强（多轮工具 + thinking/tool 组合）
+
+- 目标：
+  - 对齐官方 Gemma4 工具调用流程：支持模型多轮 `tool_calls`、支持与 thinking 同时开启、并可与多模态输入共用同一对话链路。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 扩展内置工具集合：
+      - `get_weather(location, unit)`（Open-Meteo 实时天气）
+      - `calculate_wind_chill(temperature, wind_speed_kmh, unit)`
+      - 保留 `get_current_time`、`math_calculator`
+    - 重构 `_generate_vllm_with_modes()` 的工具执行逻辑：
+      - 从“固定两步”改为“最多 `MAX_TOOL_CALL_ROUNDS` 轮”循环
+      - 每轮支持多个 `tool_calls`
+      - thinking 开启时累计保留各轮 `reasoning_content`
+      - 最终返回结构化 `reasoning_content/final_content`
+    - 保持 `thinking + tool calling + multimodal` 共存调用路径一致（都走同一 `messages/tools/extra_body` 请求构造）。
+  - `backend/app/core/config.py`
+    - 新增 `MAX_TOOL_CALL_ROUNDS`（默认 4）
+    - 新增 `WEATHER_TOOL_ENABLED`（默认 true）
+    - 新增 `WEATHER_TOOL_TIMEOUT_SECONDS`（默认 12）
+    - 新增对应校验
+  - `backend/.env.example`
+    - 补齐上述三项配置模板
+  - `README.md`
+    - 更新 Tool Calling 内置工具说明与配置说明
+- 验证：
+  - `python3 -m py_compile backend/app/services/llm_service.py backend/app/core/config.py` 通过。
+
+## 53. 2026-04-06 Tool Calling 执行轨迹透传与前端可视化
+
+- 目标：
+  - 在前端可直接查看 agent 的工具执行链路（工具名、参数、输出、耗时），支持流式和历史回放。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 工具调用循环中记录 `tool_traces`：`id/name/arguments/output/elapsed_ms/ts`。
+    - `generate_response_structured()` 输出新增 `tool_traces`。
+    - `stream_response_events()/astream_response_events()` 新增 `tool_trace` 事件类型。
+  - `backend/app/api/chat.py`
+    - 非流式 `/api/chat/` metadata 新增 `tool_traces/tool_trace_count`，并持久化到会话消息。
+    - 流式 `/api/chat/stream` 新增 SSE `tool_trace` 事件；`done` 事件携带 `tool_traces/tool_trace_count`。
+  - `backend/app/models/schema.py` + `backend/app/services/session_service.py`
+    - `ChatMessage` 与会话读写新增 `tool_traces` 字段，支持历史回放。
+  - `frontend/src/lib/api.ts` + `frontend/src/components/ChatBox.tsx`
+    - `streamMessage()` 新增 `onToolTrace` 回调，消费 SSE `tool_trace`。
+    - 聊天气泡新增“工具执行轨迹”折叠区，展示每次工具调用的参数、输出与耗时。
+  - 文档同步：
+    - `README.md` 最新进展新增 Tool Calling 轨迹可视化说明。
+- 验证：
+  - `python3 -m py_compile backend/app/services/llm_service.py backend/app/api/chat.py backend/app/services/session_service.py backend/app/models/schema.py` 通过。
+  - `cd frontend && npm run build` 失败原因不变：历史 TS6133（`SessionList.tsx`、`ui/Dialog.tsx`），无本次新增报错。
+
+## 54. 2026-04-06 Gemma4 结构化输出接入优化（response_format json_schema）
+
+- 目标：
+  - 对齐 vLLM 官方 Gemma4 recipe 的结构化输出用法，支持 `response_format={"type":"json_schema", ...}` 并贯通到项目聊天链路。
+- 已完成：
+  - `backend/app/models/schema.py`
+    - `ChatRequest` 新增 `response_format` 字段（OpenAI-compatible）。
+    - 增加请求校验：当前仅允许 `type=json_schema`，且要求 `json_schema.name/schema` 必填。
+    - `ChatModeConfigResponse` 新增 `supports_structured_output`。
+  - `backend/app/api/chat.py`
+    - 模式能力映射新增 `supports_structured_output`。
+    - 请求级新增结构化输出开关解析：`effective_structured_output`。
+    - 当 `LLM_PROVIDER!=vllm` 且请求 `response_format` 时返回 400（避免静默不生效）。
+    - `/api/chat/` 与 `/api/chat/stream` 调用层透传 `response_format` 到 LLM 服务。
+    - metadata 新增：
+      - `enable_structured_output`
+      - `requested_structured_output`
+      - `response_format_type`
+      - `response_schema_name`
+  - `backend/app/services/llm_service.py`
+    - `generate_response_structured()/stream_response_events()` 等全链路函数新增 `response_format` 参数。
+    - vLLM 非流式、流式、工具调用路径均透传 `response_format` 到 `chat.completions.create`。
+    - 与 `enable_thinking=true` 可同时开启。
+  - `frontend/src/lib/api.ts` + `frontend/src/types/index.ts`
+    - 请求/metadata 类型补齐 `response_format` 与结构化输出状态字段，便于后续 UI 接入。
+  - 文档同步：
+    - `README.md` 新增结构化输出能力说明与请求示例。
+- 验证：
+  - 待执行：`python3 -m py_compile backend/app/services/llm_service.py backend/app/api/chat.py backend/app/models/schema.py`
+
+## 55. 2026-04-06 天气工具增强：支持中文城市名查询
+
+- 目标：
+  - 修复 `get_weather` 对中文城市（如“沈阳市”）查询失败的问题。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 新增中文城市别名映射（`CN_CITY_ALIAS_TO_EN`），优先将常见中文城市转换为英文名后再调用 Open-Meteo geocoding。
+    - 新增中文地名归一化逻辑：去空格、去常见行政后缀（如“市/省/自治区/特别行政区”）并构建多候选回退查询。
+    - 新增候选结果优选逻辑：中文输入时优先中国（`country_code=CN`）结果，并按 `feature_code + population` 评分选最优城市。
+    - 天气工具返回增加 `location_query_resolved`，便于调试“原始输入 -> 实际地理编码查询词”。
+- 验证：
+  - `python3 -m py_compile backend/app/services/llm_service.py` 通过。
+
+## 56. 2026-04-06 Tool Calling 扩展：news / FX / stock
+
+- 目标：
+  - 按需求新增可玩性更强且可直接落地的工具：`search_news`、`get_exchange_rate`、`stock_quote`。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - `BUILTIN_TOOLS` 新增三个函数定义：
+      - `search_news(query, limit)`
+      - `get_exchange_rate(base_currency, target_currency, amount?)`
+      - `stock_quote(symbol)`
+    - `_execute_builtin_tool()` 新增三个执行分支：
+      - `search_news`：调用 HN Algolia API，返回标题/链接/作者/时间等结构化结果。
+      - `get_exchange_rate`：调用 `open.er-api.com`，返回汇率与可选金额换算。
+      - `stock_quote`：调用 Yahoo Finance Quote API，返回价格、涨跌幅、交易所等字段。
+    - 三个工具均复用现有 `httpx` 与超时配置，异常路径统一返回 JSON error。
+  - `README.md`
+    - 更新内置工具清单与模式说明章节。
+- 验证：
+  - `python3 -m py_compile backend/app/services/llm_service.py` 通过。
+
+## 57. 2026-04-06 时间工具优化：新增北京时间专用工具
+
+- 目标：
+  - 解决“时间查询返回不是北京时间”的体验问题，提供稳定可调用的北京时间工具。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 新增 `get_beijing_time` 工具（固定 `Asia/Shanghai`）。
+    - 优化 `get_current_time`：支持按 `timezone` 参数返回目标时区本地时间，不再只返回 UTC。
+    - 时间返回结构统一包含：
+      - `timezone`
+      - `current_time_local`
+      - `current_time_utc`
+      - `utc_offset`
+      - `unix_timestamp`
+  - `README.md`
+    - 内置工具列表新增 `get_beijing_time` 说明。
+- 验证：
+  - 待执行：`python3 -m py_compile backend/app/services/llm_service.py`
+
+## 58. 2026-04-06 Tool Calling 扩展：更常用的通用工具集
+
+- 目标：
+  - 增加高频通用工具，覆盖日常问答中的单位换算、日期信息、文本统计、唯一 ID 生成场景。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - `BUILTIN_TOOLS` 新增：
+      - `convert_unit(value, from_unit, to_unit)`：支持温度/长度/重量换算。
+      - `get_calendar_info(date?, timezone?)`：返回星期、ISO 周、是否周末。
+      - `text_stats(text)`：返回字符数/去空白字符数/词数/行数/中文字符数。
+      - `generate_uuid(version?)`：当前支持 UUID v4。
+    - 新增单位别名归一化与换算逻辑（`UNIT_ALIASES`、`LENGTH_TO_METER`、`WEIGHT_TO_GRAM`）。
+    - `_execute_builtin_tool()` 增加以上四个工具执行分支与统一 JSON 错误返回。
+  - `README.md`
+    - 更新 Tool Calling 内置工具清单与说明。
+- 验证：
+  - 待执行：`python3 -m py_compile backend/app/services/llm_service.py`
+
+## 59. 2026-04-06 Tool Calling 扩展：无外部 API 的趣味工具集
+
+- 目标：
+  - 增加一批本地可执行、无需外部网络 API 的“好玩 + 实用”工具。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - `BUILTIN_TOOLS` 新增：
+      - `random_number(min?, max?)`
+      - `coin_flip(count?)`
+      - `roll_dice(sides?, count?)`
+      - `generate_password(length?, include_symbols?)`
+      - `hash_text(text, algorithm?)`
+      - `base64_codec(mode, text)`
+    - `_execute_builtin_tool()` 新增以上 6 个工具执行分支，全部本地运行，不依赖外部 API。
+  - `README.md`
+    - 更新 Tool Calling 内置工具清单。
+- 验证：
+  - 待执行：`python3 -m py_compile backend/app/services/llm_service.py`
+
+## 35. 2026-04-08 deploy/vllm 单档位收敛
+
+- 已按“仅全能档位”收敛 `deploy/vllm` 三个文件：
+  - `deploy/vllm/start_vllm.sh`：
+    - 删除多档位分支逻辑（`rag_text/vision/full/benchmark/extreme`）
+    - 固定为单一 `full_featured` 运行模式
+    - 默认开启 `ENABLE_REASONING=1`、`ENABLE_TOOL_CALLING=1`、`ENABLE_ASYNC_SCHEDULING=1`
+    - 默认多模态预算改为 `LIMIT_MM_PER_PROMPT={"image":4,"audio":1}`（对齐官方 Gemma4 full-featured 示例）
+  - `deploy/vllm/.env.example`：
+    - 同步为单档位配置模板，仅保留兼容字段 `DEPLOY_PROFILE=full_featured`
+  - `deploy/vllm/README.md`：
+    - 删除多档位说明与不存在示例文件引用，改为单一路径启动说明
+- 后端配置结论：
+  - 当前 `backend/.env` 已是 `VLLM_DEPLOY_PROFILE=full_featured`，无需额外修改。
+
+## 36. 2026-04-08 deploy/vllm 按官方 Gemma4 recipe 演示化整理
+
+- 目标：按 vLLM 官方 Gemma4 文档收敛 `deploy/vllm` 三文件，并补充详细注释用于演示。
+- 已完成：
+  - `deploy/vllm/start_vllm.sh`
+    - 按官方 full-featured 能力集合组织参数：
+      - `--reasoning-parser gemma4`
+      - `--enable-auto-tool-choice --tool-call-parser gemma4`
+      - `--limit-mm-per-prompt image=4,audio=1`
+      - `--async-scheduling`
+    - 补齐分段注释（模型标识、网络、官方核心参数、项目吞吐参数、可选高级参数）。
+  - `deploy/vllm/.env.example`
+    - 改为演示版环境模板，逐项中文注释。
+    - 默认 `LIMIT_MM_PER_PROMPT=image=4,audio=1`（去除 `video` 预算写法）。
+  - `deploy/vllm/README.md`
+    - 改为演示导向文档：目标能力、参数讲解、演示话术、常见问题。
+- 校验：
+  - `bash -n deploy/vllm/start_vllm.sh` 通过。
+
+## 37. 2026-04-08 deploy/vllm（按实际服务器口径）再次优化
+
+- 背景：用户已替换为“服务器实际在用版本”，需继续按官方 Gemma4 配置收敛并适配现网口径。
+- 已完成：
+  - `deploy/vllm/start_vllm.sh`
+    - 移除多档位分支，固定单档位 `full_featured`。
+    - 保留并强化官方关键参数：
+      - `--limit-mm-per-prompt image=4,audio=1`
+      - `--reasoning-parser gemma4`
+      - `--enable-auto-tool-choice --tool-call-parser gemma4`
+      - `--async-scheduling`
+    - 全量中文注释，按“模型/网络/官方核心/项目吞吐/可选参数”分段。
+    - 保持用户现网端口默认值 `PORT=6008`。
+  - `deploy/vllm/.env.example`
+    - 改为中文注释演示模板，默认值与脚本一致（含 `PORT=6008`）。
+  - `deploy/vllm/README.md`
+    - 改为中文演示文档，统一端口与参数口径，补充讲解与 FAQ。
+- 校验：
+  - `bash -n deploy/vllm/start_vllm.sh` 通过。
+
+## 38. 2026-04-08 vLLM 启动报错修复（OMP_NUM_THREADS）
+
+- 问题：服务器启动 Gemma4 vLLM 时出现：
+  - `libgomp: Invalid value for environment variable OMP_NUM_THREADS`
+  - `RuntimeError: set_num_threads expects a positive integer`
+- 原因：`OMP_NUM_THREADS` 被设置为非法值（空/0/非数字），导致 torch 线程数设置失败。
+- 已修复：
+  - `deploy/vllm/start_vllm.sh`
+    - 新增线程环境变量兜底逻辑：
+      - 若 `OMP_NUM_THREADS` 非法，自动改为 `8`
+      - 若未设置，默认导出 `OMP_NUM_THREADS=8`
+  - `deploy/vllm/.env.example`
+    - 增加 `OMP_NUM_THREADS` 注释说明（必须为正整数）。
+  - `deploy/vllm/README.md`
+    - 增加该报错的原因与处理说明。
+- 校验：
+  - `bash -n deploy/vllm/start_vllm.sh` 通过。
+
+## 39. 2026-04-09 vLLM 无网场景修复（HF 本地缓存优先）
+
+- 背景：
+  - 服务器日志出现 `Network is unreachable` / `Error retrieving file list`，vLLM 启动阶段访问 Hugging Face API 失败。
+- 已修复：
+  - `deploy/vllm/start_vllm.sh`
+    - 新增 `MODEL_PATH`（本地模型目录优先）。
+    - 新增缓存自动解析：`AUTO_RESOLVE_LOCAL_MODEL=1` 时，自动从 `HUGGINGFACE_HUB_CACHE/HF_HUB_CACHE/HF_HOME/hub` 查找 `MODEL_NAME` 对应 snapshot。
+    - 新增 `FORCE_LOCAL_MODEL=1`：强制仅使用本地模型，未找到本地目录时快速失败。
+    - 新增网络探测 + 离线降级：`AUTO_OFFLINE_IF_NO_NETWORK=1` 时自动设置 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`。
+    - 启动日志新增 `MODEL_RESOLVED/MODEL_SOURCE/NETWORK_STATUS`，便于排查到底走的是远端还是本地。
+  - `deploy/vllm/.env.example`
+    - 新增离线相关模板变量（`MODEL_PATH/AUTO_RESOLVE_LOCAL_MODEL/FORCE_LOCAL_MODEL/AUTO_OFFLINE_IF_NO_NETWORK/HF_NETWORK_CHECK_TIMEOUT/HF_LOCAL_SEARCH_ROOTS`）。
+  - `deploy/vllm/README.md`
+    - 新增无公网环境的本地启动示例与参数说明。
+    - FAQ 新增 `Network is unreachable` 处理路径。
+  - `README.md`
+    - 增加离线本地模型优先启动说明（`MODEL_PATH + FORCE_LOCAL_MODEL`）。
+- 校验：
+  - `bash -n deploy/vllm/start_vllm.sh` 通过。
+
+## 40. 2026-04-09 对话附件支持 mp3 并自动走 Gemma4 音频分析
+
+- 背景：
+  - 新需求：在“上传文件”入口支持 `mp3`，并在上传的是音频时使用 Gemma4 音频能力分析，而不是按文本文件解析。
+- 已完成：
+  - `backend/app/api/chat.py`
+    - 新增“文件附件音频识别”逻辑：当 `file/file_name/file_format` 为音频（含 `mp3`）时，自动转换为 `data:audio/*` 并并入音频多模态输入。
+    - 文件为音频时跳过文本文件解析（不再走 `txt/md/pdf/csv/json/log` 的文件上下文注入路径）。
+    - 模式能力校验改为基于实际解析后的输入（含文件转音频场景），确保会触发 `supports_audio` 约束。
+    - 会话落库中，音频文件不再标记为文本附件，统一按 `has_audio/audio_url` 记录。
+  - `backend/app/models/schema.py`
+    - `ChatRequest` 新增“音频文件附件”判定；当仅上传音频文件且无文本时，默认消息改为音频模式（空白占位），避免误用“请阅读文件”提示词。
+  - `frontend/src/components/ChatBox.tsx`
+    - 回形针文件选择新增 `.mp3`。
+    - 通过回形针选择 `mp3` 时，自动切换到音频附件状态并复用已有音频上传链路（`uploadChatAudio -> /api/chat/audios/{audio_id}`）。
+    - 文件选择错误提示与按钮标题同步更新，明确 `mp3` 会自动音频分析。
+  - `README.md`
+    - 更新“对话附件上传”说明，补充 `mp3` 自动进入 Gemma4 音频理解链路。
+
+## 41. 2026-04-09 mp3 音频兼容性修复（发送前自动转 wav）
+
+- 背景：
+  - 用户反馈：上传 `mp3` 并输入提示词后，模型仍提示“音频缺失”。
+  - 研判：部分 vLLM/Gemma4 组合对 `audio/mpeg` 解码不稳定，需要统一转 `wav` 提升兼容性。
+- 已完成：
+  - `backend/app/api/chat.py`
+    - 新增 `_normalize_audio_for_vllm()`：在发送到 vLLM 前，按配置使用 `ffmpeg` 将音频转为 `wav`（单声道 16kHz）。
+    - 覆盖三条音频入模路径：
+      - `file` 附件转音频路径（含 mp3 文件）
+      - 本地 `/api/chat/audios/{audio_id}` 路径
+      - 远端 `audio_url` 预取路径
+    - 当 `ffmpeg` 不可用或转码失败时自动回退原始音频并写日志，不阻断请求。
+  - `backend/app/core/config.py` + `backend/.env.example`
+    - 新增配置：
+      - `CHAT_AUDIO_TRANSCODE_TO_WAV`（默认 true）
+      - `FFMPEG_BINARY`（默认 `ffmpeg`）
+      - `AUDIO_TRANSCODE_TIMEOUT_SECONDS`（默认 30）
+  - `README.md`
+    - 补充上述音频转码配置说明。
+
+## 42. 2026-04-09 Gemma4 Tool Calling 新增实时联网搜索工具
+
+- 背景：
+  - 用户反馈 `search_news` 返回结果不够“实时”，希望能直接查到最新资讯，且按 Gemma4 的 function tool 标注方式接入。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 新增 `search_web_realtime` 内置工具（OpenAI-compatible function schema）。
+    - 实现 Bing News RSS 实时检索链路，按时间倒序拉取并支持 `freshness` 时间窗口过滤（`hour/day/week/month/any`）。
+    - 解析并返回结构化字段：`title/url/source/published_at_utc/snippet`，附带 `searched_at_utc`。
+    - `search_news` 升级为兼容别名：优先走实时检索，失败时回退到 HN Algolia 并返回 `provider_error`。
+    - 在 `enable_tool_calling=true` 时追加工具策略提示：遇到“最新/实时/当前资讯”优先调用实时搜索工具。
+  - `README.md`
+    - 更新工具清单，新增 `search_web_realtime` 说明与参数建议。
+
+## 43. 2026-04-09 实时搜索容错增强（Google/Baidu 回退 + 验证页识别）
+
+- 背景：
+  - 实测部分环境在实时搜索时会出现 RSS 解析异常（如空响应/非 XML），且不同网络环境对 Google/Baidu 的可达性差异较大。
+- 已完成：
+  - `backend/app/services/llm_service.py`
+    - 实时检索 provider 调整为 `Bing -> Google -> Baidu`，按顺序自动回退。
+    - 新增 RSS 解析容错：空响应、非 XML 时返回可读错误并继续下一个 provider。
+    - 新增 Baidu HTML 解析与安全验证识别：命中“百度安全验证/captcha”时返回明确错误原因。
+    - 新增 `market/language` 解析逻辑：当只传 `language` 时自动推断 `market`，减少区域参数错配。

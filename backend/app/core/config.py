@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     VLLM_TIMEOUT_SECONDS: float = 600.0
     VLLM_PROBE_TIMEOUT_SECONDS: float = 8.0
     VLLM_HEALTH_CACHE_SECONDS: float = 5.0
+    MAX_TOOL_CALL_ROUNDS: int = 4
+    WEATHER_TOOL_ENABLED: bool = True
+    WEATHER_TOOL_TIMEOUT_SECONDS: float = 12.0
 
     # Multimodal safety guard (base64 chars, without data URL prefix)
     MAX_IMAGE_BASE64_CHARS: int = 50_000_000
@@ -71,6 +74,9 @@ class Settings(BaseSettings):
     CHAT_AUDIO_CACHE_TTL_SECONDS: int = 604_800
     CHAT_AUDIO_CACHE_MAX_FILES: int = 20_000
     CHAT_AUDIO_ALLOWED_EXTENSIONS: str = ".wav,.mp3,.ogg,.webm,.m4a,.mp4,.flac"
+    CHAT_AUDIO_TRANSCODE_TO_WAV: bool = True
+    FFMPEG_BINARY: str = "ffmpeg"
+    AUDIO_TRANSCODE_TIMEOUT_SECONDS: float = 30.0
     ALLOW_PUBLIC_AUDIO_URLS: bool = False
     AUDIO_FETCH_TIMEOUT_SECONDS: float = 20.0
     MAX_AUDIO_FETCH_BYTES: int = 25_000_000
@@ -168,6 +174,10 @@ class Settings(BaseSettings):
             raise ValueError("MAX_TOKENS must be > 0")
         if self.MAX_TOKENS_HARD_LIMIT < self.MAX_TOKENS:
             raise ValueError("MAX_TOKENS_HARD_LIMIT must be >= MAX_TOKENS")
+        if self.MAX_TOOL_CALL_ROUNDS <= 0:
+            raise ValueError("MAX_TOOL_CALL_ROUNDS must be > 0")
+        if self.WEATHER_TOOL_TIMEOUT_SECONDS <= 0:
+            raise ValueError("WEATHER_TOOL_TIMEOUT_SECONDS must be > 0")
 
         if self.MAX_UPLOAD_FILE_SIZE_MB <= 0:
             raise ValueError("MAX_UPLOAD_FILE_SIZE_MB must be > 0")
@@ -197,6 +207,8 @@ class Settings(BaseSettings):
             raise ValueError("CHAT_AUDIO_CACHE_TTL_SECONDS must be > 0")
         if self.CHAT_AUDIO_CACHE_MAX_FILES <= 0:
             raise ValueError("CHAT_AUDIO_CACHE_MAX_FILES must be > 0")
+        if self.AUDIO_TRANSCODE_TIMEOUT_SECONDS <= 0:
+            raise ValueError("AUDIO_TRANSCODE_TIMEOUT_SECONDS must be > 0")
         if self.AUDIO_FETCH_TIMEOUT_SECONDS <= 0:
             raise ValueError("AUDIO_FETCH_TIMEOUT_SECONDS must be > 0")
         if self.MAX_AUDIO_FETCH_BYTES <= 0:
